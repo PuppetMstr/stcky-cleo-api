@@ -13,6 +13,7 @@
     { "src": "oauth.js", "use": "@vercel/node" },
     { "src": "admin.js", "use": "@vercel/node" },
     { "src": "stripe.js", "use": "@vercel/node", "config": { "includeFiles": ["stripe.js"] } }
+    { "src": "admin-upgrade.js", "use": "@vercel/node" },
   ],
   "routes": [
     { "src": "/api/health/deep", "dest": "/health.js" },
@@ -34,5 +35,6 @@
     { "src": "/api/admin/email-export", "dest": "/admin.js" },
     { "src": "/api/stripe/checkout", "dest": "/stripe.js" },
     { "src": "/api/stripe/webhook", "dest": "/stripe.js" }
+    { "src": "/api/admin/upgrade", "dest": "/admin-upgrade.js" },
   ]
 }
