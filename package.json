@@ -1,0 +1,13 @@
+{
+  "name": "stcky-api",
+  "version": "4.4.0",
+  "description": "STCKY Memory API - Serverless endpoints for Vercel",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "mongodb": "^6.3.0",
+    "stripe": "^14.0.0"
+  }
+}

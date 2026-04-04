@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "health.js", "use": "@vercel/node" },
+    { "src": "memory.js", "use": "@vercel/node" },
+    { "src": "associative.js", "use": "@vercel/node" },
+    { "src": "enrich.js", "use": "@vercel/node" },
+    { "src": "sessions.js", "use": "@vercel/node" },
+    { "src": "projects.js", "use": "@vercel/node" },
+    { "src": "teams.js", "use": "@vercel/node" },
+    { "src": "edges.js", "use": "@vercel/node" },
+    { "src": "graph.js", "use": "@vercel/node" },
+    { "src": "oauth.js", "use": "@vercel/node" },
+    { "src": "admin.js", "use": "@vercel/node" },
+    { "src": "stripe.js", "use": "@vercel/node", "config": { "includeFiles": ["stripe.js"] } }
+  ],
+  "routes": [
+    { "src": "/api/health/deep", "dest": "/health.js" },
+    { "src": "/api/health", "dest": "/health.js" },
+    { "src": "/api/memory/list", "dest": "/memory.js" },
+    { "src": "/api/memory/search", "dest": "/memory.js" },
+    { "src": "/api/memory/upcoming", "dest": "/memory.js" },
+    { "src": "/api/memory", "dest": "/memory.js" },
+    { "src": "/api/associative", "dest": "/associative.js" },
+    { "src": "/api/enrich", "dest": "/enrich.js" },
+    { "src": "/api/sessions", "dest": "/sessions.js" },
+    { "src": "/api/projects", "dest": "/projects.js" },
+    { "src": "/api/teams", "dest": "/teams.js" },
+    { "src": "/api/edges", "dest": "/edges.js" },
+    { "src": "/api/graph", "dest": "/graph.js" },
+    { "src": "/api/oauth/authorize", "dest": "/oauth.js" },
+    { "src": "/api/oauth/token", "dest": "/oauth.js" },
+    { "src": "/api/admin/users", "dest": "/admin.js" },
+    { "src": "/api/admin/email-export", "dest": "/admin.js" },
+    { "src": "/api/stripe/checkout", "dest": "/stripe.js" },
+    { "src": "/api/stripe/webhook", "dest": "/stripe.js" }
+  ]
+}
