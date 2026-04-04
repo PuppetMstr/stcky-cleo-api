@@ -1,4 +1,4 @@
-const { MongoClient, ObjectId } = require('mongodb');
+﻿const { MongoClient, ObjectId } = require('mongodb');
 
 const uri = process.env.MONGODB_URI;
 let client;
@@ -232,7 +232,8 @@ module.exports = async (req, res) => {
             error: 'Memory limit reached',
             limit,
             current: memoryCount,
-            upgrade: 'Upgrade to Pro for more memories'
+            upgrade: 'Upgrade to Pro for more memories',
+            upgradeUrl: 'https://stcky.ai/pricing.html'
           });
         }
       }
@@ -314,3 +315,4 @@ module.exports = async (req, res) => {
     res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 };
+
