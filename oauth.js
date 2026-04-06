@@ -5,8 +5,17 @@ const uri = process.env.MONGODB_URI;
 const client = new MongoClient(uri);
 
 function getAction(url) {
+  if (url.includes('/auth/signup')) return 'signup';
   if (url.includes('/oauth/token')) return 'token';
   return 'authorize';
+}
+
+function generateApiKey() {
+  return 'cleo_' + crypto.randomBytes(16).toString('hex');
+}
+
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password).digest('hex');
 }
 
 module.exports = async function handler(req, res) {
@@ -17,6 +26,102 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   
   const action = getAction(req.url);
+
+  // ============ SIGNUP (from pricing.html) ============
+  if (action === 'signup') {
+    if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+    
+    const { email, password, profile } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+    
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+    
+    try {
+      await client.connect();
+      const db = client.db('cleo');
+      
+      // Check for existing user
+      const existing = await db.collection('users').findOne({ email: email.toLowerCase() });
+      if (existing) {
+        return res.status(409).json({ error: 'Email already registered' });
+      }
+      
+      const apiKey = generateApiKey();
+      const now = new Date();
+      
+      // Create user
+      const user = {
+        email: email.toLowerCase(),
+        passwordHash: hashPassword(password),
+        apiKey,
+        plan: 'free',
+        memoryCount: 0,
+        memoryLimit: 100,
+        projectLimit: 3,
+        createdAt: now,
+        updatedAt: now
+      };
+      
+      const userResult = await db.collection('users').insertOne(user);
+      const userId = userResult.insertedId;
+      
+      // If profile data provided, save as form-fill-profile memory
+      if (profile && typeof profile === 'object') {
+        const formFillProfile = {
+          firstName: profile.firstName || '',
+          lastName: profile.lastName || '',
+          email: email.toLowerCase(),
+          phone: profile.phone || '',
+          company: profile.company || '',
+          title: profile.title || '',
+          city: profile.city || '',
+          state: profile.state || '',
+          zip: profile.zip || '',
+          country: profile.country || 'United States'
+        };
+        
+        const memory = {
+          userId,
+          category: 'preference',
+          key: 'form-fill-profile',
+          value: JSON.stringify(formFillProfile),
+          tags: 'guardian,form-fill,profile',
+          source: 'signup',
+          importanceScore: 8,
+          stabilityScore: 9,
+          createdAt: now,
+          updatedAt: now
+        };
+        
+        await db.collection('memories').insertOne(memory);
+        
+        await db.collection('users').updateOne(
+          { _id: userId },
+          { $inc: { memoryCount: 1 } }
+        );
+      }
+      
+      return res.json({
+        success: true,
+        email: user.email,
+        apiKey: user.apiKey,
+        plan: user.plan,
+        limits: {
+          memories: user.memoryLimit,
+          projects: user.projectLimit
+        }
+      });
+      
+    } catch (error) {
+      console.error('Signup error:', error);
+      return res.status(500).json({ error: 'Signup failed' });
+    }
+  }
 
   // ============ TOKEN ============
   if (action === 'token') {
