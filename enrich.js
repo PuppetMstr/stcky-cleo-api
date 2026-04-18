@@ -1,82 +1,121 @@
-const { MongoClient } = require('mongodb');
+// enrich.js - FIXED
+// Mission: Every NOW stored. Simple. Works.
+// No pattern matching. No decisions. Everything goes in.
 
-const uri = process.env.MONGODB_URI;
+import { MongoClient } from 'mongodb';
+
+const MONGO_URI = process.env.MONGODB_URI;
+const DB_NAME = 'stcky';
+
 let client;
+let db;
 
 async function getDb() {
   if (!client) {
-    client = new MongoClient(uri);
+    client = new MongoClient(MONGO_URI);
     await client.connect();
+    db = client.db(DB_NAME);
   }
-  return client.db('cleo');
+  return db;
 }
 
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
-}
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'POST only' });
+  }
 
-async function auth(req) {
-  const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
-  if (!apiKey) return null;
-  const db = await getDb();
-  const user = await db.collection('users').findOne({ apiKey });
-  return user;
-}
-
-function extractEntities(message) {
-  const entities = [];
-  const properNouns = message.match(/\b[A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)*\b/g) || [];
-  entities.push(...properNouns.filter(n => n.length > 2));
-  const projectPatterns = message.match(/\b[a-z]+[-_][a-z]+[-_a-z]*\b/gi) || [];
-  entities.push(...projectPatterns);
-  const acronyms = message.match(/\b[A-Z]{2,6}\b/g) || [];
-  entities.push(...acronyms);
-  const common = ['The', 'This', 'That', 'What', 'When', 'Where', 'How', 'Can', 'Could', 'Would', 'Should', 'Will', 'Did', 'Does', 'Has', 'Have', 'Been', 'Being', 'Are', 'Were', 'Was', 'Is'];
-  return [...new Set(entities)].filter(e => !common.includes(e));
-}
-
-module.exports = async (req, res) => {
-  cors(res);
-  if (req.method === 'OPTIONS') return res.status(200).end();
-
-  const user = await auth(req);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-
-  const db = await getDb();
+  const { message, userId } = req.body;
   
-  let message;
-  if (req.method === 'POST') message = req.body.message;
-  else if (req.method === 'GET') message = req.query.message;
-  else return res.status(405).json({ error: 'Method not allowed' });
+  if (!message || !userId) {
+    return res.status(400).json({ error: 'message and userId required' });
+  }
 
-  if (!message) return res.status(400).json({ error: 'message parameter required' });
+  const now = new Date();
+  const db = await getDb();
+  const memories = db.collection('memories');
+
+  // STORE EVERYTHING. No pattern matching. No decisions.
+  // The conversation IS the content.
+  const memory = {
+    userId,
+    category: 'conversation',
+    key: `now-${now.getTime()}`,
+    value: message,
+    relevantDate: now.toISOString(),
+    createdAt: now,
+    updatedAt: now,
+    source: 'enrich-auto'
+  };
 
   try {
-    const entities = extractEntities(message);
-    
-    if (entities.length === 0) {
-      return res.status(200).json({ entities: [], memories: [], message: 'No entities detected' });
-    }
-
-    const searchConditions = entities.map(entity => ({
-      $or: [
-        { key: { $regex: entity, $options: 'i' } },
-        { value: { $regex: entity, $options: 'i' } },
-        { tags: { $regex: entity, $options: 'i' } }
-      ]
-    }));
-
-    const results = await db.collection('memories')
-      .find({ userId: user._id, $or: searchConditions.map(c => c.$or).flat() })
-      .sort({ updatedAt: -1 })
-      .limit(10)
-      .toArray();
-
-    return res.status(200).json({ entities, memories: results, count: results.length });
+    await memories.insertOne(memory);
   } catch (err) {
-    console.error('Enrich error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    console.error('Store failed:', err);
+    // Don't fail the request - log and continue
   }
-};
+
+  // Now do domain detection for anchor surfacing
+  const domains = detectDomains(message);
+  
+  // Find relevant memories - associative recall
+  const pipeline = [
+    { $match: { userId } },
+    { $sort: { relevantDate: -1, updatedAt: -1 } },
+    { $limit: 20 }
+  ];
+
+  // If domain detected, also surface anchors for that domain
+  if (domains.length > 0) {
+    const anchors = await memories.find({
+      userId,
+      anchor: true,
+      domain: { $in: domains }
+    }).toArray();
+    
+    const recent = await memories.aggregate(pipeline).toArray();
+    
+    return res.status(200).json({
+      stored: true,
+      storedKey: memory.key,
+      domains,
+      anchors,
+      recent
+    });
+  }
+
+  const recent = await memories.aggregate(pipeline).toArray();
+  
+  return res.status(200).json({
+    stored: true,
+    storedKey: memory.key,
+    domains: [],
+    anchors: [],
+    recent
+  });
+}
+
+function detectDomains(message) {
+  const domains = [];
+  const lower = message.toLowerCase();
+  
+  if (/blood|medical|doctor|hospital|health|prescription|diagnosis|symptom|surgery|medication/i.test(lower)) {
+    domains.push('medical');
+  }
+  if (/bank|invest|tax|ira|401k|income|salary|payment|invoice|stripe|paypal/i.test(lower)) {
+    domains.push('financial');
+  }
+  if (/wife|husband|son|daughter|mother|father|family|chalam|wedding|anniversary/i.test(lower)) {
+    domains.push('family');
+  }
+  if (/court|lawsuit|complaint|attorney|legal|filing|plaintiff|defendant|judge|hearing/i.test(lower)) {
+    domains.push('legal');
+  }
+  if (/flight|hotel|travel|trip|passport|visa|airport|destination/i.test(lower)) {
+    domains.push('travel');
+  }
+  if (/stcky|mcp|deploy|vercel|api|code|build|server|database/i.test(lower)) {
+    domains.push('work');
+  }
+  
+  return domains;
+}

@@ -17,6 +17,10 @@
   "routes": [
     { "src": "/api/health/deep", "dest": "/health.js" },
     { "src": "/api/health", "dest": "/health.js" },
+    { "src": "/api/me", "dest": "/admin.js" },
+    { "src": "/api/memory/history", "dest": "/memory.js" },
+    { "src": "/api/memory/as-of",   "dest": "/memory.js" },
+    { "src": "/api/memory/changes", "dest": "/memory.js" },
     { "src": "/api/memory/list", "dest": "/memory.js" },
     { "src": "/api/memory/search", "dest": "/memory.js" },
     { "src": "/api/memory/upcoming", "dest": "/memory.js" },

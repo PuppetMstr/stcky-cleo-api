@@ -1,28 +1,133 @@
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 
 const uri = process.env.MONGODB_URI;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'stcky_admin_2026';
 
+let client;
+
 async function getDb() {
-  const client = new MongoClient(uri);
-  await client.connect();
-  return { db: client.db('cleo'), client };
+  if (!client) {
+    client = new MongoClient(uri);
+    await client.connect();
+  }
+  return client.db('cleo');
+}
+
+// Regular user auth (for /api/me)
+async function auth(req) {
+  const db = await getDb();
+  
+  const apiKeyParam = req.query?.apiKey;
+  if (apiKeyParam) {
+    return await db.collection('users').findOne({ apiKey: apiKeyParam });
+  }
+  
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey) {
+    return await db.collection('users').findOne({ apiKey });
+  }
+  
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  
+  const token = authHeader.replace('Bearer ', '');
+  
+  if (token.startsWith('cleo_')) {
+    return await db.collection('users').findOne({ apiKey: token });
+  }
+  
+  if (token.startsWith('stcky_') && !token.startsWith('stcky_code_') && !token.startsWith('stcky_refresh_')) {
+    try {
+      const decoded = JSON.parse(Buffer.from(token.replace('stcky_', ''), 'base64').toString());
+      if (decoded.type !== 'access') return null;
+      return await db.collection('users').findOne({ _id: new ObjectId(decoded.userId) });
+    } catch (e) {
+      return null;
+    }
+  }
+  
+  return await db.collection('users').findOne({ apiKey: token });
 }
 
 function getAction(url) {
+  if (url.includes('/api/me')) return 'me';
   if (url.includes('/admin/upgrade')) return 'upgrade';
   if (url.includes('/admin/email-export')) return 'email-export';
   return 'users';
 }
 
-module.exports = async function handler(req, res) {
+function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Secret');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-Admin-Secret');
+}
 
+module.exports = async function handler(req, res) {
+  cors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const action = getAction(req.url);
+
+  // ============ ME (User Profile) ============
+  if (action === 'me') {
+    const user = await auth(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const db = await getDb();
+
+    // GET - Return user profile
+    if (req.method === 'GET') {
+      return res.json({
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        timezone: user.timezone || 'UTC',
+        tier: user.tier || 'free',
+        memoryLimit: user.memoryLimit || 100,
+        createdAt: user.createdAt,
+        lastSeen: user.lastSeen
+      });
+    }
+
+    // PUT - Update user preferences
+    if (req.method === 'PUT') {
+      const { timezone, name } = req.body;
+      
+      const updates = {};
+      
+      if (timezone) {
+        try {
+          Intl.DateTimeFormat(undefined, { timeZone: timezone });
+          updates.timezone = timezone;
+        } catch (e) {
+          return res.status(400).json({ error: 'Invalid timezone: ' + timezone });
+        }
+      }
+      
+      if (name) {
+        updates.name = name;
+      }
+      
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+      }
+      
+      updates.updatedAt = new Date();
+      
+      await db.collection('users').updateOne(
+        { _id: user._id },
+        { $set: updates }
+      );
+      
+      return res.json({
+        success: true,
+        updated: Object.keys(updates).filter(k => k !== 'updatedAt'),
+        timezone: updates.timezone || user.timezone || 'UTC'
+      });
+    }
+
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
   // ============ UPGRADE (POST only) ============
   if (action === 'upgrade') {
@@ -50,16 +155,11 @@ module.exports = async function handler(req, res) {
       return res.status(400).json({ error: 'Invalid tier. Use: free, pro, or team' });
     }
 
-    let client;
     try {
-      const connection = await getDb();
-      const db = connection.db;
-      client = connection.client;
-
+      const db = await getDb();
       const user = await db.collection('users').findOne({ email });
 
       if (!user) {
-        await client.close();
         return res.status(404).json({ error: 'User not found', email });
       }
 
@@ -81,7 +181,6 @@ module.exports = async function handler(req, res) {
       );
 
       const updatedUser = await db.collection('users').findOne({ email });
-      await client.close();
 
       return res.status(200).json({
         success: true,
@@ -96,13 +195,12 @@ module.exports = async function handler(req, res) {
       });
 
     } catch (error) {
-      if (client) await client.close();
       console.error('Admin upgrade error:', error);
       return res.status(500).json({ error: 'Server error', details: error.message });
     }
   }
 
-  // ============ GET-only routes below ============
+  // ============ GET-only admin routes below ============
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   const adminSecret = req.query.secret || req.headers['x-admin-secret'];
@@ -110,11 +208,8 @@ module.exports = async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  let client;
   try {
-    const connection = await getDb();
-    const db = connection.db;
-    client = connection.client;
+    const db = await getDb();
 
     // ============ EMAIL EXPORT ============
     if (action === 'email-export') {
@@ -170,8 +265,6 @@ module.exports = async function handler(req, res) {
       if (segment === 'power') filteredUsers = filteredUsers.filter(u => u.memoryCount >= powerMemories);
       if (segment === 'churn_risk') filteredUsers = filteredUsers.filter(u => u.memoryCount < 20);
 
-      await client.close();
-
       if (format === 'csv') {
         const header = 'email,plan,memoryCount,createdAt,lastLoginAt,daysSinceSignup,daysSinceLogin';
         const rows = filteredUsers.map(u =>
@@ -221,15 +314,12 @@ module.exports = async function handler(req, res) {
       lastLoginAt: u.lastLoginAt || null
     }));
 
-    await client.close();
-
     res.json({
       users: formattedUsers,
       count: users.length,
       stats: { total: totalUsers, free: totalFree, pro: totalPro, team: totalTeam }
     });
   } catch (error) {
-    if (client) await client.close();
     console.error('Admin error:', error);
     res.status(500).json({ error: 'Failed to process admin request' });
   }

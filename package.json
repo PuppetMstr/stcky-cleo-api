@@ -1,13 +1,14 @@
 {
   "name": "stcky-api",
-  "version": "4.4.0",
-  "description": "STCKY Memory API - Serverless endpoints for Vercel",
+  "version": "5.0.0",
+  "description": "STCKY Memory API - Semantic Memory with Vector Search",
   "private": true,
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "mongodb": "^6.3.0",
+    "mongodb": "^6.21.0",
+    "openai": "^4.52.0",
     "stripe": "^14.0.0"
   }
 }
