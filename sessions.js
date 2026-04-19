@@ -1,29 +1,4 @@
-const { MongoClient, ObjectId } = require('mongodb');
-
-const uri = process.env.MONGODB_URI;
-let client;
-
-async function getDb() {
-  if (!client) {
-    client = new MongoClient(uri);
-    await client.connect();
-  }
-  return client.db('cleo');
-}
-
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
-}
-
-async function auth(req) {
-  const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
-  if (!apiKey) return null;
-  const db = await getDb();
-  const user = await db.collection('users').findOne({ apiKey });
-  return user;
-}
+const { getDb, auth, cors, ObjectId } = require('./_lib/auth');
 
 module.exports = async (req, res) => {
   cors(res);
@@ -55,7 +30,7 @@ module.exports = async (req, res) => {
     if (req.method === 'PUT') {
       const { sessionId, summary, decisions, pending } = req.body;
       if (!sessionId || !summary) return res.status(400).json({ error: 'sessionId and summary required' });
-      
+
       await sessions.updateOne(
         { _id: new ObjectId(sessionId), userId: user._id },
         { $set: { status: 'completed', summary: summary || '', decisions: decisions || '', pending: pending || '', endedAt: new Date() } }
