@@ -3,10 +3,42 @@ const { MongoClient, ObjectId } = require('mongodb');
 const uri = process.env.MONGODB_URI;
 let client;
 
+/**
+ * Get the cleo DB handle, maintaining a module-scoped MongoClient across
+ * warm Lambda invocations.
+ *
+ * Fix (2026-04-22): if connect() throws, null out `client` so the next
+ * request retries cleanly. Previously a failed connect left `client` holding
+ * a dead object, so every subsequent `findOne` on that warm Lambda threw
+ * "MongoTopologyClosedError: Topology is closed" until Vercel cycled the
+ * instance. Surfaced during the morning MongoDB password rotation when
+ * early requests hit the URI before the new password propagated.
+ *
+ * Also listens for topology-level close events so we rebuild the client
+ * if the driver loses the connection mid-lifetime.
+ */
 async function getDb() {
   if (!client) {
-    client = new MongoClient(uri);
-    await client.connect();
+    const c = new MongoClient(uri);
+
+    // If the topology closes (network loss, server-side kill, etc.), drop
+    // the reference so the next getDb() call builds a fresh client.
+    c.on('topologyClosed', () => {
+      if (client === c) client = null;
+    });
+    c.on('close', () => {
+      if (client === c) client = null;
+    });
+
+    try {
+      await c.connect();
+      client = c;
+    } catch (err) {
+      // Connect failed — do NOT assign `c` to `client`. Leave `client` null
+      // so the next request tries fresh. Attempt best-effort cleanup.
+      try { await c.close(); } catch {}
+      throw err;
+    }
   }
   return client.db('cleo');
 }
