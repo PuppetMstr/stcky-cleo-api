@@ -1,53 +1,8 @@
-const { MongoClient, ObjectId } = require('mongodb');
+const { getDb, auth, ObjectId } = require('./_lib/auth');
 
-const uri = process.env.MONGODB_URI;
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'stcky_admin_2026';
-
-let client;
-
-async function getDb() {
-  if (!client) {
-    client = new MongoClient(uri);
-    await client.connect();
-  }
-  return client.db('cleo');
-}
-
-// Regular user auth (for /api/me)
-async function auth(req) {
-  const db = await getDb();
-  
-  const apiKeyParam = req.query?.apiKey;
-  if (apiKeyParam) {
-    return await db.collection('users').findOne({ apiKey: apiKeyParam });
-  }
-  
-  const apiKey = req.headers['x-api-key'];
-  if (apiKey) {
-    return await db.collection('users').findOne({ apiKey });
-  }
-  
-  const authHeader = req.headers['authorization'];
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-  
-  const token = authHeader.replace('Bearer ', '');
-  
-  if (token.startsWith('cleo_')) {
-    return await db.collection('users').findOne({ apiKey: token });
-  }
-  
-  if (token.startsWith('stcky_') && !token.startsWith('stcky_code_') && !token.startsWith('stcky_refresh_')) {
-    try {
-      const decoded = JSON.parse(Buffer.from(token.replace('stcky_', ''), 'base64').toString());
-      if (decoded.type !== 'access') return null;
-      return await db.collection('users').findOne({ _id: new ObjectId(decoded.userId) });
-    } catch (e) {
-      return null;
-    }
-  }
-  
-  return await db.collection('users').findOne({ apiKey: token });
-}
+// ADMIN_SECRET must be set in environment. No fallback.
+// /api/me does not require this; only /api/admin/* endpoints do.
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 function getAction(url) {
   if (url.includes('/api/me')) return 'me';
@@ -60,6 +15,20 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-Admin-Secret');
+}
+
+// Fail loud if admin secret is missing. Returns true if check passes.
+function requireAdminSecret(req, res, providedSecret) {
+  if (!ADMIN_SECRET) {
+    console.error('[ADMIN] ADMIN_SECRET environment variable is not configured');
+    res.status(503).json({ error: 'Admin functionality not configured on server' });
+    return false;
+  }
+  if (!providedSecret || providedSecret !== ADMIN_SECRET) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
 }
 
 module.exports = async function handler(req, res) {
@@ -137,9 +106,7 @@ module.exports = async function handler(req, res) {
 
     const { email, tier, secret } = req.body;
 
-    if (secret !== ADMIN_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (!requireAdminSecret(req, res, secret)) return;
 
     if (!email || !tier) {
       return res.status(400).json({ error: 'Missing email or tier' });
@@ -204,9 +171,7 @@ module.exports = async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   const adminSecret = req.query.secret || req.headers['x-admin-secret'];
-  if (!adminSecret || adminSecret !== ADMIN_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!requireAdminSecret(req, res, adminSecret)) return;
 
   try {
     const db = await getDb();
