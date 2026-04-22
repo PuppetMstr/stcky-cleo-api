@@ -6,3 +6,16 @@ node_modules/
 .DS_Store
 .vercel
 .env*.local
+
+# Local backup files (pattern established 2026-04-22)
+# We intentionally keep timestamped backups locally when editing production files,
+# but these should never be committed. Git history is the proper versioning layer.
+*.bak
+*.bak-*
+*.backup
+*.backup-*
+
+# Stray empties from terminal output that accidentally got interpreted as commands
+# (happened a few times on 2026-04-22 when cmd output got pasted back into cmd)
+/git
+/main
