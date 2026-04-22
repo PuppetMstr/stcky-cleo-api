@@ -22,6 +22,11 @@ const EVENT_TYPES = new Set([
   'relationship_updated',
   'task_completed',
   'observation_logged',
+  // Blob Door v0.1 — Chaos Q5 (Apr 21, 2026): same ledger, extended vocabulary.
+  'object_ingested',
+  'object_chunked',
+  'object_embedded',
+  'search_executed',
 ]);
 
 const PAYLOAD_MODES = new Set(['whole_state', 'field_patch', 'json_patch']);

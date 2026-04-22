@@ -65,6 +65,10 @@
                    {
                        "src":  "federation.js",
                        "use":  "@vercel/node"
+                   },
+                   {
+                       "src":  "ingest.js",
+                       "use":  "@vercel/node"
                    }
                ],
     "routes":  [
@@ -83,6 +87,10 @@
                    {
                        "src":  "/api/agent-message",
                        "dest":  "/agent-message.js"
+                   },
+                   {
+                       "src":  "/api/ingest",
+                       "dest":  "/ingest.js"
                    },
                    {
                        "src":  "/api/health/deep",
