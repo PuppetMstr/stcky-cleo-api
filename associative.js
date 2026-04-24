@@ -1,30 +1,46 @@
 /**
- * STCKY Associative Recall v5.1.0 — HYBRID CROSS-COLLECTION SEARCH
+ * STCKY Associative Recall v5.2.0 — RUNG 3 READ-SIDE UNIFICATION (behind flag)
+ *
+ * v5.2.0 (2026-04-24):
+ *   - Added v3 retrieval pipeline behind RETRIEVAL_V3_MODE env var:
+ *       off    → legacy path only (default, byte-for-byte unchanged from 5.1.0)
+ *       shadow → run legacy + v3 in parallel, return legacy, log divergence
+ *       canary → v3 for users in CANARY_USER_IDS, shadow for others
+ *       on     → v3 for all users
+ *   - v3 pipeline queries memories + objects + events in parallel, runs
+ *     adapter normalization into canonical envelopes, ranks via
+ *     _lib/retrieval-ranker.js using combined semantic+lexical+recency+trust.
+ *   - v3 response is ADDITIVE: legacy memories/objects arrays still populated,
+ *     new events array + candidates array added. No client breakage.
+ *   - Shadow divergence events written to cleo.events with
+ *     type='retrieval_shadow_compared', scoped to user, excluded from recall.
+ *   - Legacy path completely unchanged when RETRIEVAL_V3_MODE=off (default).
  *
  * v5.1.0 (2026-04-22):
- *   - Added objectsVectorSearch against `objects` collection (Blob Door v0.1)
- *     using objects_vector_index (3072-dim, text-embedding-3-large).
- *   - Response now includes `objects: [...]` alongside existing `memories: [...]`.
- *     Existing clients that read only `memories` keep working unchanged.
- *   - Query is embedded twice (small + large) so we can search both indexes
- *     without dimension-mismatch errors. Fires in parallel.
- *   - Partial failure is tolerated: if either collection search fails, the
- *     other still returns results and the caller sees which path succeeded.
+ *   - Added objectsVectorSearch against `objects` collection.
+ *   - Response includes `objects: [...]` alongside `memories: [...]`.
  *
  * v5.0.0:
- *   - Hybrid retrieval: Vector search + keyword fallback on memories.
- *   - Temporal NOW scoring for recency and relevance.
+ *   - Hybrid vector + keyword on memories. Temporal NOW scoring.
  */
 
 const { getDb, auth, cors, ObjectId } = require('./_lib/auth');
 const { embed } = require('./_lib/embeddings');
 
+// Rung 3 helpers (inert if RETRIEVAL_V3_MODE is 'off')
+const {
+  memoryToCanonical,
+  objectToCanonical,
+  eventToCanonical,
+} = require('./_lib/event-adapters');
+const { rankCandidates }   = require('./_lib/retrieval-ranker');
+const { runShadowCompare } = require('./_lib/retrieval-shadow');
+
 const MEMORIES_VECTOR_INDEX = 'memory_vector_index';
 const OBJECTS_VECTOR_INDEX  = 'objects_vector_index';
 
 // --------------------------------------------------------------------------
-// Temporal scoring (unchanged from v5.0.0 for memories).
-// For objects, scoring uses `timestamp` (event time) and `ingested_at`.
+// Temporal scoring (unchanged from v5.0.0/5.1.0 — used by LEGACY path only).
 // --------------------------------------------------------------------------
 
 function calculateTemporalScore(memory, now) {
@@ -48,7 +64,6 @@ function calculateTemporalScore(memory, now) {
 }
 
 function calculateObjectTemporalScore(obj, now) {
-  // Objects use `timestamp` (event/client time) primarily, with ingested_at as fallback.
   let score = 0;
   const anchorTime = obj.timestamp || obj.ingested_at || obj.server_ingest_timestamp;
   if (anchorTime) {
@@ -116,11 +131,7 @@ async function memoryKeywordSearch(db, userId, queryTerms, limit) {
 }
 
 // --------------------------------------------------------------------------
-// Object search paths (new in v5.1.0).
-// Objects are stored by /api/ingest in the `objects` collection with 3072-dim
-// embeddings. We search them in parallel with memories and return a separate
-// result array so the caller can distinguish raw ingested content from
-// curated memories.
+// Object search paths (unchanged).
 // --------------------------------------------------------------------------
 
 async function objectsVectorSearch(db, userId, queryEmbedding, limit) {
@@ -139,20 +150,13 @@ async function objectsVectorSearch(db, userId, queryEmbedding, limit) {
       {
         $project: {
           _id: 1,
-          object_id: 1,
-          content: 1,
-          content_length: 1,
-          source_type: 1,
-          source: 1,
-          speaker: 1,
-          session_id: 1,
-          turn_index: 1,
-          trace_id: 1,
-          client: 1,
-          timestamp: 1,
-          ingested_at: 1,
-          parent_object_id: 1,
-          chunk_index: 1,
+          object_id: 1, content: 1, content_length: 1,
+          source_type: 1, source: 1, speaker: 1,
+          session_id: 1, turn_index: 1, trace_id: 1, client: 1,
+          timestamp: 1, ingested_at: 1,
+          parent_object_id: 1, chunk_index: 1,
+          embedding: 1, // needed by adapter to determine enrichment.state
+          metadata: 1,
           vectorScore: { $meta: 'vectorSearchScore' }
         }
       }
@@ -185,7 +189,39 @@ async function objectsKeywordSearch(db, userId, queryTerms, limit) {
 }
 
 // --------------------------------------------------------------------------
-// Merge + rank (memory side, unchanged).
+// Events search path (NEW in v5.2.0 for Rung 3).
+// Events are the Phase 0 audit log. They are NOT semantically embedded
+// (adapter flags them enrichment.state='skipped'). Lexical only.
+// Shadow log events are excluded from recall to prevent recursive noise.
+// --------------------------------------------------------------------------
+
+async function eventsKeywordSearch(db, userId, queryTerms, limit) {
+  if (queryTerms.length === 0) return [];
+
+  const searchConditions = queryTerms.map(term => ({
+    $or: [
+      { type:  { $regex: term, $options: 'i' } },
+      { actor: { $regex: term, $options: 'i' } }
+    ]
+  }));
+
+  try {
+    return await db.collection('events')
+      .find({
+        userId: userId,
+        type: { $ne: 'retrieval_shadow_compared' }, // don't recurse into shadow logs
+        $or: searchConditions.map(c => c.$or).flat()
+      })
+      .limit(limit * 3)
+      .toArray();
+  } catch (error) {
+    console.log('[ASSOCIATIVE] Events keyword search failed:', error.message);
+    return [];
+  }
+}
+
+// --------------------------------------------------------------------------
+// Merge + rank (legacy paths, unchanged).
 // --------------------------------------------------------------------------
 
 function mergeAndRankMemories(vectorResults, keywordResults, queryTerms, now) {
@@ -232,10 +268,6 @@ function mergeAndRankMemories(vectorResults, keywordResults, queryTerms, now) {
   return merged;
 }
 
-// --------------------------------------------------------------------------
-// Merge + rank (object side, new).
-// --------------------------------------------------------------------------
-
 function mergeAndRankObjects(vectorResults, keywordResults, queryTerms, now) {
   const seen = new Set();
   const merged = [];
@@ -280,7 +312,6 @@ function mergeAndRankObjects(vectorResults, keywordResults, queryTerms, now) {
   return merged;
 }
 
-// Generic keyword score — works for any doc shape by passing in the fields to scan.
 function calculateKeywordScore(doc, queryTerms, fields) {
   if (!queryTerms || queryTerms.length === 0) return 0;
   let score = 0;
@@ -291,6 +322,274 @@ function calculateKeywordScore(doc, queryTerms, fields) {
     }
   }
   return Math.round(score);
+}
+
+// --------------------------------------------------------------------------
+// LEGACY pipeline — v5.1.0 logic extracted into a helper.
+// Returns the response object (no res.json() — caller does that).
+// --------------------------------------------------------------------------
+
+async function runLegacyPipeline({ db, user, query, queryTerms, limit, now, includeMemories, includeObjects, projectId, previousLastSeen }) {
+  const [smallEmbed, largeEmbed] = await Promise.all([
+    includeMemories ? embed(query, 'small') : Promise.resolve(null),
+    includeObjects  ? embed(query, 'large') : Promise.resolve(null),
+  ]);
+
+  const memoryTasks = [];
+  if (includeMemories) {
+    memoryTasks.push(smallEmbed?.embedding
+      ? memoryVectorSearch(db, user._id, smallEmbed.embedding, limit)
+      : Promise.resolve(null));
+    memoryTasks.push(memoryKeywordSearch(db, user._id, queryTerms, limit));
+  } else {
+    memoryTasks.push(Promise.resolve(null), Promise.resolve([]));
+  }
+
+  const objectTasks = [];
+  if (includeObjects) {
+    objectTasks.push(largeEmbed?.embedding
+      ? objectsVectorSearch(db, user._id, largeEmbed.embedding, limit)
+      : Promise.resolve(null));
+    objectTasks.push(objectsKeywordSearch(db, user._id, queryTerms, limit));
+  } else {
+    objectTasks.push(Promise.resolve(null), Promise.resolve([]));
+  }
+
+  const [memVec, memKw, objVec, objKw] = await Promise.all([...memoryTasks, ...objectTasks]);
+
+  const rankedMemories = includeMemories
+    ? mergeAndRankMemories(memVec, memKw, queryTerms, now).slice(0, limit)
+    : [];
+  const rankedObjects = includeObjects
+    ? mergeAndRankObjects(objVec, objKw, queryTerms, now).slice(0, limit)
+    : [];
+
+  const searchMethod = {
+    memories: memVec && memVec.length > 0 ? 'hybrid' : (memKw && memKw.length > 0 ? 'keyword' : 'none'),
+    objects:  objVec && objVec.length > 0 ? 'hybrid' : (objKw && objKw.length > 0 ? 'keyword' : 'none'),
+  };
+
+  return {
+    response: {
+      now: now.toISOString(),
+      lastSeen: previousLastSeen,
+      searchMethod,
+      memories: rankedMemories,
+      count: rankedMemories.length,
+      objects: rankedObjects,
+      objects_count: rankedObjects.length,
+      query,
+      projectId: projectId || null,
+    },
+    memoryIdsForAccessUpdate: rankedMemories.map(m => m._id),
+  };
+}
+
+// --------------------------------------------------------------------------
+// V3 pipeline (Rung 3). Queries three collections, adapts to canonical
+// envelopes, ranks via shared ranker, returns additive response shape.
+// --------------------------------------------------------------------------
+
+async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeMemories, includeObjects, includeEvents, projectId, previousLastSeen }) {
+  // Use the LARGE embedding for both memories and objects so a single vector
+  // can drive semantic scoring across sources. Legacy kept them split because
+  // the indexes use different dimensions; but for RANKING we want a single
+  // semantic axis. Memories index is 1536 (small), objects index is 3072
+  // (large) — so we actually need both embeddings, one per source's index.
+  const [smallEmbed, largeEmbed] = await Promise.all([
+    includeMemories ? embed(query, 'small') : Promise.resolve(null),
+    includeObjects  ? embed(query, 'large') : Promise.resolve(null),
+  ]);
+
+  const memoryTasks = [];
+  if (includeMemories) {
+    memoryTasks.push(smallEmbed?.embedding
+      ? memoryVectorSearch(db, user._id, smallEmbed.embedding, limit)
+      : Promise.resolve(null));
+    memoryTasks.push(memoryKeywordSearch(db, user._id, queryTerms, limit));
+  } else {
+    memoryTasks.push(Promise.resolve(null), Promise.resolve([]));
+  }
+
+  const objectTasks = [];
+  if (includeObjects) {
+    objectTasks.push(largeEmbed?.embedding
+      ? objectsVectorSearch(db, user._id, largeEmbed.embedding, limit)
+      : Promise.resolve(null));
+    objectTasks.push(objectsKeywordSearch(db, user._id, queryTerms, limit));
+  } else {
+    objectTasks.push(Promise.resolve(null), Promise.resolve([]));
+  }
+
+  const eventTasks = [];
+  if (includeEvents) {
+    eventTasks.push(eventsKeywordSearch(db, user._id, queryTerms, limit));
+  } else {
+    eventTasks.push(Promise.resolve([]));
+  }
+
+  const [memVec, memKw, objVec, objKw, evtKw] = await Promise.all([
+    ...memoryTasks, ...objectTasks, ...eventTasks,
+  ]);
+
+  // --- Build canonical candidates + signal map ---
+  const candidates = [];
+  const signalsMap = new Map();
+
+  // Memories
+  const memRawById = new Map();
+  for (const m of (memVec || [])) {
+    memRawById.set(m._id.toString(), { doc: m, vec: m.vectorScore || 0, kw: 0 });
+  }
+  for (const m of (memKw || [])) {
+    const id = m._id.toString();
+    const kwScore = calculateKeywordScore(m, queryTerms, ['key', 'value', 'tags', 'category']);
+    if (memRawById.has(id)) {
+      memRawById.get(id).kw = kwScore;
+    } else {
+      memRawById.set(id, { doc: m, vec: 0, kw: kwScore });
+    }
+  }
+  for (const { doc, vec, kw } of memRawById.values()) {
+    const c = memoryToCanonical(doc);
+    if (!c) continue;
+    candidates.push(c);
+    signalsMap.set(c.event_id, { semantic: vec, lexical: kw / 40 });
+  }
+
+  // Objects
+  const objRawById = new Map();
+  for (const o of (objVec || [])) {
+    objRawById.set(o._id.toString(), { doc: o, vec: o.vectorScore || 0, kw: 0 });
+  }
+  for (const o of (objKw || [])) {
+    const id = o._id.toString();
+    const kwScore = calculateKeywordScore(o, queryTerms, ['content', 'source', 'speaker']);
+    if (objRawById.has(id)) {
+      objRawById.get(id).kw = kwScore;
+    } else {
+      objRawById.set(id, { doc: o, vec: 0, kw: kwScore });
+    }
+  }
+  for (const { doc, vec, kw } of objRawById.values()) {
+    const c = objectToCanonical(doc);
+    if (!c) continue;
+    candidates.push(c);
+    signalsMap.set(c.event_id, { semantic: vec, lexical: kw / 40 });
+  }
+
+  // Events (lexical only — adapter flags enrichment.state='skipped' so ranker
+  // will zero out semantic even if we passed a nonzero value)
+  for (const e of (evtKw || [])) {
+    const c = eventToCanonical(e);
+    if (!c) continue;
+    const kwScore = calculateKeywordScore(e, queryTerms, ['type', 'actor']);
+    candidates.push(c);
+    signalsMap.set(c.event_id, { semantic: 0, lexical: kwScore / 40 });
+  }
+
+  // --- Rank ---
+  const ranked = rankCandidates(candidates, signalsMap, {
+    nowMs: now.getTime(),
+    limit,
+  });
+
+  // --- Build additive response ---
+  const candidatesOut = ranked.map(r => ({
+    event_id:          r.candidate.event_id,
+    score:             Math.round(r.score * 1000) / 1000,
+    source_collection: r.candidate.meta.source_collection,
+    kind:              r.candidate.kind,
+    ts_human:          r.candidate.ts_human,
+    summary:           r.candidate.summary,
+    payload:           r.candidate.payload,
+    actor:             r.candidate.actor,
+    flags:             r.candidate.flags,
+    enrichment:        r.candidate.enrichment,
+    trust:             r.candidate.trust,
+    meta:              r.candidate.meta,
+    breakdown:         r.breakdown,
+  }));
+
+  // Legacy arrays are populated by filtering `ranked` — preserves back-compat.
+  // Legacy format per source is the ORIGINAL raw doc, not the canonical
+  // envelope, so clients reading `memories`/`objects` keep their existing
+  // field shape. We re-resolve from the raw-doc maps.
+  const legacyMemories = [];
+  const legacyObjects  = [];
+  const legacyEvents   = [];
+  for (const r of ranked) {
+    const sc = r.candidate.meta.source_collection;
+    const legacyId = r.candidate.meta.legacy_id;
+    if (sc === 'memories') {
+      const entry = memRawById.get(legacyId);
+      if (entry) {
+        entry.doc.relevanceScore = Math.round(r.score * 100);
+        legacyMemories.push(entry.doc);
+      }
+    } else if (sc === 'objects') {
+      const entry = objRawById.get(legacyId);
+      if (entry) {
+        entry.doc.relevanceScore = Math.round(r.score * 100);
+        legacyObjects.push(entry.doc);
+      }
+    } else if (sc === 'events') {
+      legacyEvents.push({
+        _id: legacyId,
+        type: r.candidate.kind,
+        actor: r.candidate.actor.actor_id,
+        ts_human: r.candidate.ts_human,
+        summary: r.candidate.summary,
+        relevanceScore: Math.round(r.score * 100),
+      });
+    }
+  }
+
+  const searchMethod = {
+    memories: memVec && memVec.length > 0 ? 'hybrid' : (memKw && memKw.length > 0 ? 'keyword' : 'none'),
+    objects:  objVec && objVec.length > 0 ? 'hybrid' : (objKw && objKw.length > 0 ? 'keyword' : 'none'),
+    events:   (evtKw && evtKw.length > 0) ? 'keyword' : 'none',
+  };
+
+  return {
+    response: {
+      now: now.toISOString(),
+      lastSeen: previousLastSeen,
+      searchMethod,
+      memories: legacyMemories,
+      count: legacyMemories.length,
+      objects: legacyObjects,
+      objects_count: legacyObjects.length,
+      events: legacyEvents,
+      events_count: legacyEvents.length,
+      candidates: candidatesOut,
+      candidates_count: candidatesOut.length,
+      query,
+      projectId: projectId || null,
+      retrieval_mode: 'v3',
+    },
+    memoryIdsForAccessUpdate: legacyMemories.map(m => m._id),
+    ranked, // for shadow-mode divergence log
+  };
+}
+
+// --------------------------------------------------------------------------
+// Mode resolution
+// --------------------------------------------------------------------------
+
+function resolveMode(user) {
+  const raw = String(process.env.RETRIEVAL_V3_MODE || 'off').toLowerCase();
+  const canaryIds = String(process.env.CANARY_USER_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const userIdStr = user && user._id && String(user._id);
+  const isCanary = userIdStr && canaryIds.includes(userIdStr);
+
+  if (raw === 'on')     return { mode: 'v3',     isCanary, reason: 'on' };
+  if (raw === 'canary') return { mode: isCanary ? 'v3' : 'shadow', isCanary, reason: 'canary' };
+  if (raw === 'shadow') return { mode: 'shadow', isCanary, reason: 'shadow' };
+  return { mode: 'legacy', isCanary, reason: 'off' };
 }
 
 // --------------------------------------------------------------------------
@@ -306,26 +605,28 @@ module.exports = async (req, res) => {
 
   const db = await getDb();
 
-  // Track lastSeen
+  // Track lastSeen — applies to all modes, runs exactly once per request.
   const previousLastSeen = user.lastSeen || null;
   await db.collection('users').updateOne(
     { _id: user._id },
     { $set: { lastSeen: new Date() } }
   );
 
-  let query, limit, projectId, includeObjects, includeMemories;
+  let query, limit, projectId, includeObjects, includeMemories, includeEvents;
   if (req.method === 'POST') {
     query = req.body.query;
     limit = req.body.limit || 10;
     projectId = req.body.projectId;
-    includeObjects  = req.body.includeObjects  !== false; // default ON
-    includeMemories = req.body.includeMemories !== false; // default ON
+    includeObjects  = req.body.includeObjects  !== false;
+    includeMemories = req.body.includeMemories !== false;
+    includeEvents   = req.body.includeEvents   !== false; // v3 only; legacy ignores
   } else if (req.method === 'GET') {
     query = req.query.query;
     limit = parseInt(req.query.limit) || 10;
     projectId = req.query.projectId;
     includeObjects  = req.query.includeObjects  !== 'false';
     includeMemories = req.query.includeMemories !== 'false';
+    includeEvents   = req.query.includeEvents   !== 'false';
   } else {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -336,75 +637,93 @@ module.exports = async (req, res) => {
     const now = new Date();
     const queryTerms = query.split(/\s+/).filter(t => t.length > 2);
 
-    // Embed the query at both sizes. Run in parallel. If either fails we
-    // still proceed with the one that succeeded.
-    const [smallEmbed, largeEmbed] = await Promise.all([
-      includeMemories ? embed(query, 'small') : Promise.resolve(null),
-      includeObjects  ? embed(query, 'large') : Promise.resolve(null),
-    ]);
+    const { mode, isCanary, reason } = resolveMode(user);
 
-    // Kick off all searches in parallel.
-    const memoryTasks = [];
-    if (includeMemories) {
-      if (smallEmbed?.embedding) {
-        memoryTasks.push(memoryVectorSearch(db, user._id, smallEmbed.embedding, limit));
-      } else {
-        memoryTasks.push(Promise.resolve(null));
-      }
-      memoryTasks.push(memoryKeywordSearch(db, user._id, queryTerms, limit));
-    } else {
-      memoryTasks.push(Promise.resolve(null), Promise.resolve([]));
-    }
-
-    const objectTasks = [];
-    if (includeObjects) {
-      if (largeEmbed?.embedding) {
-        objectTasks.push(objectsVectorSearch(db, user._id, largeEmbed.embedding, limit));
-      } else {
-        objectTasks.push(Promise.resolve(null));
-      }
-      objectTasks.push(objectsKeywordSearch(db, user._id, queryTerms, limit));
-    } else {
-      objectTasks.push(Promise.resolve(null), Promise.resolve([]));
-    }
-
-    const [memVec, memKw, objVec, objKw] = await Promise.all([...memoryTasks, ...objectTasks]);
-
-    const rankedMemories = includeMemories
-      ? mergeAndRankMemories(memVec, memKw, queryTerms, now).slice(0, limit)
-      : [];
-    const rankedObjects  = includeObjects
-      ? mergeAndRankObjects(objVec, objKw, queryTerms, now).slice(0, limit)
-      : [];
-
-    // Update access counts on returned memories (keeps existing behavior).
-    const memIds = rankedMemories.map(m => m._id);
-    if (memIds.length > 0) {
-      await db.collection('memories').updateMany(
-        { _id: { $in: memIds } },
-        { $inc: { accessCount: 1 }, $set: { lastAccessedAt: now } }
-      );
-    }
-
-    // Search method summary.
-    const searchMethod = {
-      memories: memVec && memVec.length > 0 ? 'hybrid' : (memKw && memKw.length > 0 ? 'keyword' : 'none'),
-      objects:  objVec && objVec.length > 0 ? 'hybrid' : (objKw && objKw.length > 0 ? 'keyword' : 'none'),
+    const commonArgs = {
+      db, user, query, queryTerms, limit, now,
+      includeMemories, includeObjects, includeEvents,
+      projectId, previousLastSeen,
     };
 
-    return res.status(200).json({
-      now: now.toISOString(),
-      lastSeen: previousLastSeen,
-      searchMethod,
-      memories: rankedMemories,
-      count: rankedMemories.length,
-      objects: rankedObjects,
-      objects_count: rankedObjects.length,
-      query,
-      projectId: projectId || null,
-    });
+    // -------- LEGACY (mode=off) --------
+    if (mode === 'legacy') {
+      const { response, memoryIdsForAccessUpdate } = await runLegacyPipeline(commonArgs);
+      await bumpAccessCounts(db, memoryIdsForAccessUpdate, now);
+      return res.status(200).json(response);
+    }
+
+    // -------- V3 (mode=on or canary-matched user) --------
+    if (mode === 'v3') {
+      const { response, memoryIdsForAccessUpdate } = await runV3Pipeline(commonArgs);
+      await bumpAccessCounts(db, memoryIdsForAccessUpdate, now);
+      return res.status(200).json(response);
+    }
+
+    // -------- SHADOW (mode=shadow, or mode=canary for non-canary users) --------
+    if (mode === 'shadow') {
+      // Build a scoped event logger that writes to cleo.events with userId.
+      const eventLogger = async (evt) => {
+        try {
+          await db.collection('events').insertOne({
+            ...evt,
+            userId: user._id,
+          });
+        } catch (e) {
+          console.log('[ASSOCIATIVE] shadow log write failed:', e.message);
+        }
+      };
+
+      // Cache the legacy result so we can both return it and bump access counts.
+      let capturedLegacy = null;
+
+      const legacyResp = await runShadowCompare({
+        legacyFn: async () => {
+          capturedLegacy = await runLegacyPipeline(commonArgs);
+          return capturedLegacy.response;
+        },
+        v3Fn: async () => {
+          const v3 = await runV3Pipeline(commonArgs);
+          return { ranked: v3.ranked, raw: v3.response };
+        },
+        logEvent: eventLogger,
+        context: {
+          query,
+          apiKey: req.headers && req.headers.authorization
+            ? req.headers.authorization.replace(/^Bearer\s+/i, '')
+            : (req.query && req.query.apiKey) || null,
+          request_id: req.headers && (req.headers['x-request-id'] || req.headers['x-vercel-id']) || null,
+          user_id: String(user._id),
+          canary_eligible: isCanary,
+          mode_reason: reason,
+        },
+      });
+
+      if (capturedLegacy && capturedLegacy.memoryIdsForAccessUpdate) {
+        await bumpAccessCounts(db, capturedLegacy.memoryIdsForAccessUpdate, now);
+      }
+      return res.status(200).json(legacyResp);
+    }
+
+    // Should never reach here
+    return res.status(500).json({ error: 'Unknown retrieval mode', mode });
+
   } catch (err) {
     console.error('Associative error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+// Access-count bump — preserved from legacy. Runs once per request, only on
+// the memories that the user actually received. Shadow mode does NOT
+// double-count (only the returned-to-user path bumps).
+async function bumpAccessCounts(db, memoryIds, now) {
+  if (!memoryIds || memoryIds.length === 0) return;
+  try {
+    await db.collection('memories').updateMany(
+      { _id: { $in: memoryIds } },
+      { $inc: { accessCount: 1 }, $set: { lastAccessedAt: now } }
+    );
+  } catch (e) {
+    console.log('[ASSOCIATIVE] accessCount update failed:', e.message);
+  }
+}
