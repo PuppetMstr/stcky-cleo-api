@@ -1,4 +1,4 @@
-// admin-shadow-stats.js v0.2
+// admin-shadow-stats.js v0.3
 //
 // GET /api/admin/shadow-stats?since=ISO_DATE
 // Returns aggregate statistics over `retrieval_shadow_compared` events for ops review of
@@ -173,10 +173,10 @@ module.exports = async (req, res) => {
       if (status.v3_error) v3ErrorCount++;
       if (status.legacy_error) legacyErrorCount++;
       if (div.skipped) skippedCount++;
-
-      // For top-divergent queries: collect those with high rank_delta or low jaccard
+           // For top-divergent queries: collect those with high rank_delta or low jaccard
       if (typeof div.rank_delta === 'number' && p.query) {
         queryDivergence.push({
+         _id: doc._id,
           query: p.query,
           rank_delta: div.rank_delta,
           jaccard: div.jaccard ?? null,
@@ -307,7 +307,7 @@ module.exports = async (req, res) => {
           'payload.status.legacy_error',
           'payload.query',
         ],
-        endpoint_version: '0.2',
+        endpoint_version: '0.3',
         endpoint_author: 'Eli',
         endpoint_date: '2026-04-25',
       },
