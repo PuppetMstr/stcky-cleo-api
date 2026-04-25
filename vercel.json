@@ -73,6 +73,10 @@
                    {
                        "src":  "admin-shadow-stats.js",
                        "use":  "@vercel/node"
+                   },
+                   {
+                       "src":  "admin-shadow-diff.js",
+                       "use":  "@vercel/node"
                    }
                ],
     "routes":  [
@@ -191,6 +195,10 @@
                    {
                        "src":  "/api/admin/shadow-stats",
                        "dest":  "/admin-shadow-stats.js"
+                   },
+                   {
+                       "src":  "/api/admin/shadow-diff",
+                       "dest":  "/admin-shadow-diff.js"
                    },
                    {
                        "src":  "/api/stripe/checkout",

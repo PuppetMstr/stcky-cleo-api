@@ -1,20 +1,25 @@
-// admin-shadow-stats.js
+// admin-shadow-stats.js v0.2
 //
 // GET /api/admin/shadow-stats?since=ISO_DATE
 // Returns aggregate statistics over `retrieval_shadow_compared` events for ops review of
 // Rung 3 shadow mode rollout health. Read-only. ADMIN_SECRET gated.
 //
-// Healthy signal thresholds (working hypothesis — tune with observed data):
-//   - count: > 50 in the inspected window
-//   - jaccard mean: > 0.5 (significant overlap legacy vs v3)
-//   - rank_delta median: < 5 (top results not heavily reordered)
-//   - only_in_legacy mean: < 1 (v3 not systematically missing things legacy returns)
-//   - v3 p95 latency: < 1.5x legacy p95 (within Chaos's 25% regression bar with margin)
-//   - v3 error count: 0
+// v0.2 (2026-04-25) — RECALIBRATED THRESHOLDS per Chaos's Apr 25 canary gate response.
+// v0.1 thresholds assumed v3 should match legacy nearly identically. After v5.2.1+v5.2.2
+// patches, v3's unified ranker produces intentionally different (but symmetric) divergence
+// from legacy. Updated thresholds reward symmetric divergence (= ranker doing its job)
+// and flag asymmetric divergence (= actual regression signal).
+//
+// CHAOS GATE (Apr 25 response):
+//   1. No systematic source suppression (only_in_legacy not >> only_in_v3)
+//   2. abs(only_in_legacy - only_in_v3) low and diffs explainable
+//   3. Quality floor via moderate jaccard (>= 0.4) or manual relevance wins
+//   4. 100+ shadow events preferred, zero v3 errors, latency <= 1.25x ideal
+//   5. 10+ manual diffs judged neutral-or-better (handled separately via shadow-diff endpoint)
 //
 // Yellow / red flag interpretation guide is in the response under `_interpretation`.
 //
-// Author: Eli — Apr 25, 2026
+// Author: Eli — Apr 25, 2026 (v0.1 → v0.2 same morning)
 // Field paths in the divergence event payload are based on rung-3-shadow-skeleton-2026-04-24.
 // First call returns one `_meta.sample_event` so Steven can verify the shape matches before relying on aggregates.
 
@@ -197,25 +202,58 @@ module.exports = async (req, res) => {
     const legacyLatencyStats = summarizeNumericValues(legacyLatencies);
     const v3LatencyStats = summarizeNumericValues(v3Latencies);
 
-    // Verdict logic — quick health signal
+    // Verdict logic v0.2 — recalibrated per Chaos's Apr 25 gate response
     const flags = [];
-    if (docs.length < 10) flags.push('LOW_VOLUME');
-    if (jaccardStats.mean !== null && jaccardStats.mean < 0.3) flags.push('LOW_JACCARD');
-    else if (jaccardStats.mean !== null && jaccardStats.mean < 0.5) flags.push('YELLOW_JACCARD');
-    if (onlyInLegacyStats.mean !== null && onlyInLegacyStats.mean > 3) flags.push('V3_BLIND_SPOTS');
-    else if (onlyInLegacyStats.mean !== null && onlyInLegacyStats.mean > 1) flags.push('YELLOW_V3_BLIND_SPOTS');
+
+    // LOW_VOLUME: Chaos prefers 100+ events; under that is YELLOW (not blocking)
+    if (docs.length < 100) flags.push('LOW_VOLUME');
+
+    // JACCARD: recalibrated floor at 0.4 (was 0.5). Ranker divergence is by design.
+    if (jaccardStats.mean !== null) {
+      if (jaccardStats.mean < 0.3) flags.push('LOW_JACCARD');
+      else if (jaccardStats.mean < 0.4) flags.push('YELLOW_JACCARD');
+    }
+
+    // DIVERGENCE ASYMMETRY (Chaos gate criterion 1+2):
+    // Symmetric divergence = healthy ranker behavior. Asymmetric divergence in legacy's
+    // favor = systematic source suppression (the bug we fixed). Asymmetric in v3's favor
+    // = noise flooding (less critical, still worth flagging).
+    if (onlyInLegacyStats.mean !== null && onlyInV3Stats.mean !== null) {
+      const legacyMean = onlyInLegacyStats.mean;
+      const v3Mean = onlyInV3Stats.mean;
+      const absDiff = Math.abs(legacyMean - v3Mean);
+
+      // V3_BLIND_SPOTS: legacy mean exceeds v3 mean by 2x AND legacy >= 2 absolute
+      // (the systematic suppression signal that triggered the original RED finding)
+      if (legacyMean > v3Mean * 2 && legacyMean >= 2) {
+        flags.push('V3_BLIND_SPOTS');
+      }
+      // V3_NOISE_FLOOD: v3 surfaces >>2x what legacy does, AND v3 >= 3 absolute
+      // (yellow because more is recoverable than less, but worth review)
+      else if (v3Mean > legacyMean * 2 && v3Mean >= 3) {
+        flags.push('YELLOW_V3_NOISE_FLOOD');
+      }
+      // ASYMMETRY (yellow): absolute difference > 2 even if not 2x ratio
+      else if (absDiff > 2) {
+        flags.push('YELLOW_ASYMMETRY');
+      }
+    }
+
+    // V3 ERRORS: any > 0 is RED
     if (v3ErrorCount > 0) flags.push(`V3_ERRORS_${v3ErrorCount}`);
+
+    // LATENCY: <=1.25 GREEN, 1.25-2.0 YELLOW, >2.0 RED
     if (legacyLatencyStats.p95 && v3LatencyStats.p95) {
       const ratio = v3LatencyStats.p95 / legacyLatencyStats.p95;
       if (ratio > 2) flags.push('V3_LATENCY_2X');
-      else if (ratio > 1.5) flags.push('YELLOW_V3_LATENCY_1.5X');
+      else if (ratio > 1.25) flags.push('YELLOW_V3_LATENCY_125X');
     }
 
     let verdict;
     if (flags.some((f) => f.startsWith('V3_ERRORS') || f === 'LOW_JACCARD' || f === 'V3_BLIND_SPOTS' || f === 'V3_LATENCY_2X')) {
       verdict = 'RED — shadow data shows anomalies; do not promote to canary';
     } else if (flags.some((f) => f.startsWith('YELLOW') || f === 'LOW_VOLUME')) {
-      verdict = 'YELLOW — review flags before promoting to canary';
+      verdict = 'YELLOW — review flags; canary acceptable if manual diff inspection clean';
     } else {
       verdict = 'GREEN — shadow data healthy; safe to promote to canary';
     }
@@ -247,13 +285,13 @@ module.exports = async (req, res) => {
       },
       top_divergent_queries: topDivergent,
       _interpretation: {
-        jaccard_mean: 'Higher = more overlap between legacy and v3 top results. Healthy: > 0.5. Yellow: 0.3-0.5. Red: < 0.3.',
-        rank_delta: 'Lower = items shared between legacy and v3 ranked similarly. High values mean v3 is heavily reordering shared candidates.',
-        only_in_legacy_mean:
-          'Items legacy returns that v3 misses. Should trend low. > 1 means v3 has blind spots; > 3 is a red flag.',
-        only_in_v3_mean:
-          'Items v3 returns that legacy misses. Expected non-zero (v3 sees events legacy cannot), but if very high, v3 may be flooding noise.',
-        v3_p95_vs_legacy_p95_ratio: 'Chaos bar from Rung 3 plan: ≤ 1.25 ideal, ≤ 2.0 acceptable during canary, > 2.0 unacceptable.',
+        jaccard_mean: 'Higher = more overlap between legacy and v3 top results. v0.2 thresholds (post-Chaos-recalibration): >= 0.4 healthy, 0.3-0.4 yellow, < 0.3 red. Lower than v0.1 because v3 ranker is intentionally different from legacy.',
+        rank_delta: 'Lower = items shared between legacy and v3 ranked similarly. High values mean v3 is heavily reordering shared candidates. Not directly thresholded — informational.',
+        only_in_legacy_mean: 'Items legacy returns that v3 misses. v0.2 interpretation: not flagged in isolation. Only flagged when STRONGLY ASYMMETRIC vs only_in_v3 (legacy >> v3 indicates systematic suppression — the V3_BLIND_SPOTS bug).',
+        only_in_v3_mean: 'Items v3 returns that legacy misses. v0.2 interpretation: symmetric with only_in_legacy is HEALTHY (ranker doing its unified-scoring job). v3 >> legacy is YELLOW_V3_NOISE_FLOOD.',
+        asymmetry: 'V3_BLIND_SPOTS = legacy_mean > 2 * v3_mean AND legacy_mean >= 2. YELLOW_V3_NOISE_FLOOD = v3_mean > 2 * legacy_mean AND v3_mean >= 3. YELLOW_ASYMMETRY = abs(diff) > 2 without 2x ratio.',
+        v3_p95_vs_legacy_p95_ratio: 'Chaos bar: <= 1.25 ideal (GREEN), 1.25-2.0 acceptable during canary (YELLOW), > 2.0 unacceptable (RED).',
+        low_volume: 'LOW_VOLUME = under 100 events. YELLOW (not blocking) per Chaos "100+ preferred." Manual diff inspection (shadow-diff endpoint) can compensate at lower volume.',
       },
       _meta: {
         sample_event: docs[0], // first event so we can verify the field paths assumed in this code match reality
@@ -269,7 +307,7 @@ module.exports = async (req, res) => {
           'payload.status.legacy_error',
           'payload.query',
         ],
-        endpoint_version: '0.1',
+        endpoint_version: '0.2',
         endpoint_author: 'Eli',
         endpoint_date: '2026-04-25',
       },
