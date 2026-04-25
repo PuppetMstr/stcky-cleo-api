@@ -1,5 +1,15 @@
 /**
- * STCKY Associative Recall v5.2.0 — RUNG 3 READ-SIDE UNIFICATION (behind flag)
+ * STCKY Associative Recall v5.2.1 — RUNG 3 READ-SIDE UNIFICATION (behind flag)
+ *
+ * v5.2.1 (2026-04-25):
+ *   - PATCH: fixed v3 legacy back-compat array limit semantics.
+ *     v5.2.0's runV3Pipeline built legacyMemories/legacyObjects/legacyEvents
+ *     by filtering the merged `ranked` list (capped at `limit` total). When
+ *     memories outscored objects in the unified ranker, objects got squeezed
+ *     out of the legacy arrays — surfaced as V3_BLIND_SPOTS in shadow stats.
+ *     Fix: per-source ranking for legacy arrays preserves "limit per source"
+ *     contract from runLegacyPipeline. Merged `candidates` field unchanged
+ *     (still uses unified ranker at limit total — intentional new semantic).
  *
  * v5.2.0 (2026-04-24):
  *   - Added v3 retrieval pipeline behind RETRIEVAL_V3_MODE env var:
@@ -488,11 +498,27 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     signalsMap.set(c.event_id, { semantic: 0, lexical: kwScore / 40 });
   }
 
-  // --- Rank ---
+  // --- Rank (merged, for new candidates field) ---
   const ranked = rankCandidates(candidates, signalsMap, {
     nowMs: now.getTime(),
     limit,
   });
+
+  // --- Rank per source (for legacy back-compat arrays) ---
+  // PATCH 2026-04-25: legacy arrays must preserve the "limit per source"
+  // contract from runLegacyPipeline. The previous shape filtered the merged
+  // `ranked` list (capped at `limit` total), which let memories squeeze
+  // objects out of the legacy arrays when they outscored objects in the
+  // unified ranker — caused V3_BLIND_SPOTS in shadow data 2026-04-25.
+  // Fix: rank each source separately for the legacy arrays. The new
+  // `candidates` field still uses the merged ranked list (intentional new
+  // semantic — best N regardless of source).
+  const memCandidates = candidates.filter(c => c.meta.source_collection === 'memories');
+  const objCandidates = candidates.filter(c => c.meta.source_collection === 'objects');
+  const evtCandidates = candidates.filter(c => c.meta.source_collection === 'events');
+  const memRanked = rankCandidates(memCandidates, signalsMap, { nowMs: now.getTime(), limit });
+  const objRanked = rankCandidates(objCandidates, signalsMap, { nowMs: now.getTime(), limit });
+  const evtRanked = rankCandidates(evtCandidates, signalsMap, { nowMs: now.getTime(), limit });
 
   // --- Build additive response ---
   const candidatesOut = ranked.map(r => ({
@@ -511,38 +537,35 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     breakdown:         r.breakdown,
   }));
 
-  // Legacy arrays are populated by filtering `ranked` — preserves back-compat.
-  // Legacy format per source is the ORIGINAL raw doc, not the canonical
-  // envelope, so clients reading `memories`/`objects` keep their existing
-  // field shape. We re-resolve from the raw-doc maps.
+  // Legacy arrays from per-source ranked lists. Same raw-doc shape as legacy
+  // pipeline so clients reading `memories`/`objects` keep their existing
+  // field shape unchanged.
   const legacyMemories = [];
-  const legacyObjects  = [];
-  const legacyEvents   = [];
-  for (const r of ranked) {
-    const sc = r.candidate.meta.source_collection;
-    const legacyId = r.candidate.meta.legacy_id;
-    if (sc === 'memories') {
-      const entry = memRawById.get(legacyId);
-      if (entry) {
-        entry.doc.relevanceScore = Math.round(r.score * 100);
-        legacyMemories.push(entry.doc);
-      }
-    } else if (sc === 'objects') {
-      const entry = objRawById.get(legacyId);
-      if (entry) {
-        entry.doc.relevanceScore = Math.round(r.score * 100);
-        legacyObjects.push(entry.doc);
-      }
-    } else if (sc === 'events') {
-      legacyEvents.push({
-        _id: legacyId,
-        type: r.candidate.kind,
-        actor: r.candidate.actor.actor_id,
-        ts_human: r.candidate.ts_human,
-        summary: r.candidate.summary,
-        relevanceScore: Math.round(r.score * 100),
-      });
+  for (const r of memRanked) {
+    const entry = memRawById.get(r.candidate.meta.legacy_id);
+    if (entry) {
+      entry.doc.relevanceScore = Math.round(r.score * 100);
+      legacyMemories.push(entry.doc);
     }
+  }
+  const legacyObjects = [];
+  for (const r of objRanked) {
+    const entry = objRawById.get(r.candidate.meta.legacy_id);
+    if (entry) {
+      entry.doc.relevanceScore = Math.round(r.score * 100);
+      legacyObjects.push(entry.doc);
+    }
+  }
+  const legacyEvents = [];
+  for (const r of evtRanked) {
+    legacyEvents.push({
+      _id: r.candidate.meta.legacy_id,
+      type: r.candidate.kind,
+      actor: r.candidate.actor.actor_id,
+      ts_human: r.candidate.ts_human,
+      summary: r.candidate.summary,
+      relevanceScore: Math.round(r.score * 100),
+    });
   }
 
   const searchMethod = {
