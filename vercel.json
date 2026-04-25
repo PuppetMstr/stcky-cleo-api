@@ -69,6 +69,10 @@
                    {
                        "src":  "ingest.js",
                        "use":  "@vercel/node"
+                   },
+                   {
+                       "src":  "admin-shadow-stats.js",
+                       "use":  "@vercel/node"
                    }
                ],
     "routes":  [
@@ -183,6 +187,10 @@
                    {
                        "src":  "/api/admin/email-export",
                        "dest":  "/admin.js"
+                   },
+                   {
+                       "src":  "/api/admin/shadow-stats",
+                       "dest":  "/admin-shadow-stats.js"
                    },
                    {
                        "src":  "/api/stripe/checkout",
