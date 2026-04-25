@@ -1,5 +1,16 @@
 /**
- * STCKY Associative Recall v5.2.1 — RUNG 3 READ-SIDE UNIFICATION (behind flag)
+ * STCKY Associative Recall v5.2.2 — RUNG 3 READ-SIDE UNIFICATION (behind flag)
+ *
+ * v5.2.2 (2026-04-25):
+ *   - PATCH: fixed shadow comparison apples-to-oranges. v5.2.1's runV3Pipeline
+ *     correctly built per-source legacy back-compat arrays, but the shadow
+ *     harness still received `v3.ranked` (merged top-N capped at limit total)
+ *     while legacy passed its two-array shape. Comparison showed false-positive
+ *     blind spots because v3 had 5 items vs legacy's 10. Fix: runV3Pipeline
+ *     additionally returns `rankedForShadow` = [...memRanked, ...objRanked,
+ *     ...evtRanked] (per-source, matches legacy two-array shape). v3Fn passes
+ *     rankedForShadow to shadow harness. The merged `ranked` is unchanged and
+ *     still available to v3-aware consumers via the `candidates` response field.
  *
  * v5.2.1 (2026-04-25):
  *   - PATCH: fixed v3 legacy back-compat array limit semantics.
@@ -592,7 +603,15 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
       retrieval_mode: 'v3',
     },
     memoryIdsForAccessUpdate: legacyMemories.map(m => m._id),
-    ranked, // for shadow-mode divergence log
+    ranked, // merged top-N (limit total) — for v3-aware consumers via candidates field
+    // PATCH 2026-04-25 v5.2.2: rankedForShadow concatenates per-source ranked lists
+    // (each capped at limit per source) so shadow comparison sees the same shape
+    // legacy returns from runLegacyPipeline (memories + objects two-array). Without
+    // this, flattenV3Ranking would receive only `ranked` (capped at limit total)
+    // and shadow would always show false-positive "blind spots" because the
+    // comparison is apples-to-oranges (5 v3 items vs 10 legacy items). The merged
+    // `ranked` is still returned for v3-aware consumers; this is purely additional.
+    rankedForShadow: [...memRanked, ...objRanked, ...evtRanked],
   };
 }
 
@@ -706,7 +725,10 @@ module.exports = async (req, res) => {
         },
         v3Fn: async () => {
           const v3 = await runV3Pipeline(commonArgs);
-          return { ranked: v3.ranked, raw: v3.response };
+          // PATCH 2026-04-25 v5.2.2: pass rankedForShadow (per-source merged) to
+          // keep comparison fair vs legacy's two-array shape. v3.ranked is the
+          // merged top-N capped at limit total — apples-to-oranges for shadow.
+          return { ranked: v3.rankedForShadow, raw: v3.response };
         },
         logEvent: eventLogger,
         context: {
