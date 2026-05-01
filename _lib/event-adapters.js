@@ -1,6 +1,9 @@
 // cleo-api/_lib/event-adapters.js
 // ---------------------------------------------------------------------------
 // RUNG 3 — Retrieval Plane read-side unification
+// RUNG 4 — Corrections as superseding events (parseSupersedesFromValue +
+//          supersedes_keys in memoryToCanonical's meta; inert unless
+//          RUNG_4_MODE is set in associative.js)
 //
 // Normalizes the three legacy collections (cleo.memories, cleo.objects,
 // cleo.events) into a single canonical candidate envelope per Blob Substrate
@@ -43,6 +46,39 @@ const EMBEDDING_EXPECTED_DIM = 3072; // text-embedding-3-large
 const KNOWN_AGENT_IDS = new Set([
   'claude', 'claude-unknown', 'chaos', 'eli',
 ]);
+
+// --- SUPERSEDES line parsing (RUNG 4) ---------------------------------------
+// For category=correction memories, parse SUPERSEDES lines from value text.
+// Format: "SUPERSEDES: <category>/<key>" (one or more, comma-separated, on
+// its own line). Returns array of {category, key} objects, or null if no
+// valid line found.
+//
+// Example values that parse correctly:
+//   "SUPERSEDES: pattern/morning-loop-may-1-2026"
+//   "SUPERSEDES: pattern/foo, now/state-2026-05-01-0600am"
+//
+// Lenient: ignores leading whitespace, ignores empty entries, requires both
+// category and key non-empty around the slash.
+
+function parseSupersedesFromValue(text) {
+  if (!text || typeof text !== 'string') return null;
+  const result = [];
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const m = line.match(/^\s*SUPERSEDES:\s*(.+?)\s*$/);
+    if (!m) continue;
+    const items = m[1].split(',').map(s => s.trim()).filter(Boolean);
+    for (const item of items) {
+      const slash = item.indexOf('/');
+      if (slash > 0 && slash < item.length - 1) {
+        const category = item.slice(0, slash).trim();
+        const key = item.slice(slash + 1).trim();
+        if (category && key) result.push({ category, key });
+      }
+    }
+  }
+  return result.length > 0 ? result : null;
+}
 
 // --- Helpers ----------------------------------------------------------------
 
@@ -182,6 +218,13 @@ function memoryToCanonical(mem) {
   const tsCommit = isoOrNull(mem.createdAt) || tsHuman;
   const payload  = mem.value || '';
 
+  // RUNG 4: parse SUPERSEDES line for category=correction memories.
+  // Inert if category is anything else (returns null, which the resolver
+  // treats as "this memory does not supersede anything").
+  const supersedes_keys = (mem.category === 'correction')
+    ? parseSupersedesFromValue(payload)
+    : null;
+
   return {
     event_id: `mem_${id}`,
     seq: null,
@@ -213,6 +256,7 @@ function memoryToCanonical(mem) {
         tags: mem.tags || null,
         anchor: mem.anchor === true,
       },
+      supersedes_keys, // RUNG 4: null unless category=correction with valid SUPERSEDES line
     },
   };
 }
@@ -330,4 +374,7 @@ module.exports = {
   SOURCE_PRIORS,
   SUMMARY_MAX_CHARS,
   EMBEDDING_EXPECTED_DIM,
+
+  // RUNG 4: exported for unit tests
+  parseSupersedesFromValue,
 };

@@ -1,5 +1,18 @@
 /**
- * STCKY Associative Recall v5.2.2 — RUNG 3 READ-SIDE UNIFICATION (behind flag)
+ * STCKY Associative Recall v5.2.3 — RUNG 4 DEPLOY-INERT
+ *
+ * v5.2.3 (2026-05-01):
+ *   - RUNG 4 DEPLOY-INERT: wires correction-resolver.js into runV3Pipeline
+ *     behind RUNG_4_MODE env var (off / shadow / canary / on). Default 'off'
+ *     leaves resolver code loaded but unreached — runV3Pipeline behavior
+ *     identical to v5.2.2.
+ *   - Resolver is purely additive at READ time. Original memories stay in
+ *     cleo.memories untouched. Direct memory_recall always returns originals;
+ *     only associative_recall filters when resolver is active.
+ *   - resolveRung4Mode() mirrors resolveMode() pattern, reuses CANARY_USER_IDS
+ *     for canary user matching.
+ *   - Single-env-var rollback at every step. v5.2.2 backup as
+ *     associative.js.bak-v5.2.2-pre-rung-4.
  *
  * v5.2.2 (2026-04-25):
  *   - PATCH: fixed shadow comparison apples-to-oranges. v5.2.1's runV3Pipeline
@@ -56,6 +69,9 @@ const {
 } = require('./_lib/event-adapters');
 const { rankCandidates }   = require('./_lib/retrieval-ranker');
 const { runShadowCompare } = require('./_lib/retrieval-shadow');
+
+// Rung 4 helpers (inert if RUNG_4_MODE is 'off')
+const { resolveCorrections, shadowDivergence } = require('./_lib/correction-resolver');
 
 const MEMORIES_VECTOR_INDEX = 'memory_vector_index';
 const OBJECTS_VECTOR_INDEX  = 'objects_vector_index';
@@ -409,9 +425,11 @@ async function runLegacyPipeline({ db, user, query, queryTerms, limit, now, incl
 // --------------------------------------------------------------------------
 // V3 pipeline (Rung 3). Queries three collections, adapts to canonical
 // envelopes, ranks via shared ranker, returns additive response shape.
+// RUNG 4 (v5.2.3): correction resolver runs between candidate building and
+// ranking when RUNG_4_MODE is shadow/canary/on.
 // --------------------------------------------------------------------------
 
-async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeMemories, includeObjects, includeEvents, projectId, previousLastSeen }) {
+async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeMemories, includeObjects, includeEvents, projectId, previousLastSeen, rung4 }) {
   // Use the LARGE embedding for both memories and objects so a single vector
   // can drive semantic scoring across sources. Legacy kept them split because
   // the indexes use different dimensions; but for RANKING we want a single
@@ -509,8 +527,28 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     signalsMap.set(c.event_id, { semantic: 0, lexical: kwScore / 40 });
   }
 
+  // --- RUNG 4: resolve corrections (gated by RUNG_4_MODE) ---
+  // Per design-note/rung-4-corrections-resolver-design-v0.2-2026-05-01.
+  // Resolver is purely additive at read time — original memories stay in
+  // cleo.memories untouched. Direct key lookup via memory_recall always
+  // returns the original; only associative_recall filters when rung4.active.
+  let workingCandidates = candidates;
+  let rung4DivergenceLog = null;
+
+  if (rung4 && rung4.active) {
+    // Live: filter candidates through correction resolver
+    workingCandidates = resolveCorrections(candidates);
+  } else if (rung4 && rung4.shadow) {
+    // Shadow: compute filter but don't apply; log divergence
+    const resolved = resolveCorrections(candidates);
+    rung4DivergenceLog = shadowDivergence(candidates, resolved);
+    // workingCandidates stays as `candidates` — shadow doesn't apply filter.
+  }
+
   // --- Rank (merged, for new candidates field) ---
-  const ranked = rankCandidates(candidates, signalsMap, {
+  // Uses workingCandidates so Rung 4 resolver filtering (when active) flows
+  // through into ranking and per-source legacy arrays consistently.
+  const ranked = rankCandidates(workingCandidates, signalsMap, {
     nowMs: now.getTime(),
     limit,
   });
@@ -524,9 +562,11 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
   // Fix: rank each source separately for the legacy arrays. The new
   // `candidates` field still uses the merged ranked list (intentional new
   // semantic — best N regardless of source).
-  const memCandidates = candidates.filter(c => c.meta.source_collection === 'memories');
-  const objCandidates = candidates.filter(c => c.meta.source_collection === 'objects');
-  const evtCandidates = candidates.filter(c => c.meta.source_collection === 'events');
+  // RUNG 4 (v5.2.3): per-source filtering uses workingCandidates so resolver
+  // filtering applies consistently to legacy arrays as well.
+  const memCandidates = workingCandidates.filter(c => c.meta.source_collection === 'memories');
+  const objCandidates = workingCandidates.filter(c => c.meta.source_collection === 'objects');
+  const evtCandidates = workingCandidates.filter(c => c.meta.source_collection === 'events');
   const memRanked = rankCandidates(memCandidates, signalsMap, { nowMs: now.getTime(), limit });
   const objRanked = rankCandidates(objCandidates, signalsMap, { nowMs: now.getTime(), limit });
   const evtRanked = rankCandidates(evtCandidates, signalsMap, { nowMs: now.getTime(), limit });
@@ -585,6 +625,20 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     events:   (evtKw && evtKw.length > 0) ? 'keyword' : 'none',
   };
 
+  // RUNG 4 shadow log: fire-and-forget. Don't block response on write
+  // failures. Event surfaces in associative_recall as substrate-health
+  // signal per "everything in / everything out" principle.
+  if (rung4DivergenceLog && rung4DivergenceLog.filtered_count > 0) {
+    db.collection('events').insertOne({
+      type: 'rung_4_shadow_divergence',
+      userId: user._id,
+      actor: 'system',
+      payload: { ...rung4DivergenceLog, query, retrieval_mode: 'v3' },
+      createdAt: new Date(),
+      metadata: { ts_human: new Date().toISOString() },
+    }).catch(e => console.log('[ASSOCIATIVE] rung 4 shadow log failed:', e.message));
+  }
+
   return {
     response: {
       now: now.toISOString(),
@@ -616,7 +670,7 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
 }
 
 // --------------------------------------------------------------------------
-// Mode resolution
+// Mode resolution (Rung 3)
 // --------------------------------------------------------------------------
 
 function resolveMode(user) {
@@ -632,6 +686,37 @@ function resolveMode(user) {
   if (raw === 'canary') return { mode: isCanary ? 'v3' : 'shadow', isCanary, reason: 'canary' };
   if (raw === 'shadow') return { mode: 'shadow', isCanary, reason: 'shadow' };
   return { mode: 'legacy', isCanary, reason: 'off' };
+}
+
+// --------------------------------------------------------------------------
+// RUNG 4 mode resolution. Reads RUNG_4_MODE env var (off / shadow / canary /
+// on), reuses CANARY_USER_IDS from Rung 3 for canary user matching.
+//
+// Returns { active, shadow, reason }:
+//   active=true  → resolver filters candidates for this user
+//   shadow=true  → resolver runs but doesn't filter; divergence logged
+//   both false   → resolver inert
+//
+// Modes:
+//   off    → { active: false, shadow: false }       (default)
+//   shadow → { active: false, shadow: true  }       (everyone gets shadow log)
+//   canary → if user in CANARY_USER_IDS: active     else: shadow
+//   on     → { active: true,  shadow: false }       (everyone)
+// --------------------------------------------------------------------------
+
+function resolveRung4Mode(user) {
+  const raw = String(process.env.RUNG_4_MODE || 'off').toLowerCase();
+  const canaryIds = String(process.env.CANARY_USER_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const userIdStr = user && user._id && String(user._id);
+  const isCanary = userIdStr && canaryIds.includes(userIdStr);
+
+  if (raw === 'on')     return { active: true,  shadow: false, reason: 'on' };
+  if (raw === 'canary') return { active: isCanary, shadow: !isCanary, reason: isCanary ? 'canary-on' : 'canary-shadow' };
+  if (raw === 'shadow') return { active: false, shadow: true,  reason: 'shadow' };
+  return { active: false, shadow: false, reason: 'off' };
 }
 
 // --------------------------------------------------------------------------
@@ -680,11 +765,13 @@ module.exports = async (req, res) => {
     const queryTerms = query.split(/\s+/).filter(t => t.length > 2);
 
     const { mode, isCanary, reason } = resolveMode(user);
+    const rung4 = resolveRung4Mode(user); // { active, shadow, reason }
 
     const commonArgs = {
       db, user, query, queryTerms, limit, now,
       includeMemories, includeObjects, includeEvents,
       projectId, previousLastSeen,
+      rung4, // RUNG 4: { active, shadow, reason }
     };
 
     // -------- LEGACY (mode=off) --------
