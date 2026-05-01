@@ -535,21 +535,6 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
   let workingCandidates = candidates;
   let rung4DivergenceLog = null;
 
-  // RUNG 4 DIAGNOSTIC (temporary)
-  const supersedersInCandidates = candidates.filter(c =>
-    c && c.meta && Array.isArray(c.meta.supersedes_keys) && c.meta.supersedes_keys.length > 0
-  );
-  console.log('[RUNG4-DIAG] runV3Pipeline pre-resolver:', JSON.stringify({
-    rung4,
-    candidates_total: candidates.length,
-    superseders_count: supersedersInCandidates.length,
-    superseders_sample: supersedersInCandidates.slice(0, 3).map(c => ({
-      event_id: c.event_id,
-      legacy_key: c.meta && c.meta.legacy_fields && c.meta.legacy_fields.key,
-      supersedes_keys: c.meta.supersedes_keys,
-    })),
-  }));
-
   if (rung4 && rung4.active) {
     // Live: filter candidates through correction resolver
     workingCandidates = resolveCorrections(candidates);
@@ -558,10 +543,6 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     const resolved = resolveCorrections(candidates);
     rung4DivergenceLog = shadowDivergence(candidates, resolved);
     // workingCandidates stays as `candidates` — shadow doesn't apply filter.
-    console.log('[RUNG4-DIAG] shadow branch executed:', JSON.stringify({
-      filtered_count: rung4DivergenceLog.filtered_count,
-      filtered_keys: rung4DivergenceLog.filtered_keys,
-    }));
   }
 
   // --- Rank (merged, for new candidates field) ---
@@ -648,7 +629,6 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
   // failures. Event surfaces in associative_recall as substrate-health
   // signal per "everything in / everything out" principle.
   if (rung4DivergenceLog && rung4DivergenceLog.filtered_count > 0) {
-    console.log('[RUNG4-DIAG] writing rung_4_shadow_divergence event with filtered_count=' + rung4DivergenceLog.filtered_count);
     db.collection('events').insertOne({
       type: 'rung_4_shadow_divergence',
       userId: user._id,
@@ -656,14 +636,7 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
       payload: { ...rung4DivergenceLog, query, retrieval_mode: 'v3' },
       createdAt: new Date(),
       metadata: { ts_human: new Date().toISOString() },
-    })
-    .then(r => console.log('[RUNG4-DIAG] event write succeeded, id=' + (r && r.insertedId)))
-    .catch(e => console.log('[RUNG4-DIAG] event write failed:', e.message));
-  } else {
-    console.log('[RUNG4-DIAG] skipping event write:', JSON.stringify({
-      has_log: !!rung4DivergenceLog,
-      filtered_count: rung4DivergenceLog ? rung4DivergenceLog.filtered_count : null,
-    }));
+    }).catch(e => console.log('[ASSOCIATIVE] rung 4 shadow log failed:', e.message));
   }
 
   return {
@@ -740,23 +713,10 @@ function resolveRung4Mode(user) {
   const userIdStr = user && user._id && String(user._id);
   const isCanary = userIdStr && canaryIds.includes(userIdStr);
 
-  let result;
-  if (raw === 'on')          result = { active: true,  shadow: false, reason: 'on' };
-  else if (raw === 'canary') result = { active: isCanary, shadow: !isCanary, reason: isCanary ? 'canary-on' : 'canary-shadow' };
-  else if (raw === 'shadow') result = { active: false, shadow: true,  reason: 'shadow' };
-  else                       result = { active: false, shadow: false, reason: 'off' };
-
-  // RUNG 4 DIAGNOSTIC (temporary, remove after shadow-mode verification)
-  console.log('[RUNG4-DIAG] resolveRung4Mode:', JSON.stringify({
-    env_raw: process.env.RUNG_4_MODE,
-    env_type: typeof process.env.RUNG_4_MODE,
-    env_lowered: raw,
-    user_id: userIdStr,
-    is_canary: isCanary,
-    result,
-  }));
-
-  return result;
+  if (raw === 'on')     return { active: true,  shadow: false, reason: 'on' };
+  if (raw === 'canary') return { active: isCanary, shadow: !isCanary, reason: isCanary ? 'canary-on' : 'canary-shadow' };
+  if (raw === 'shadow') return { active: false, shadow: true,  reason: 'shadow' };
+  return { active: false, shadow: false, reason: 'off' };
 }
 
 // --------------------------------------------------------------------------
