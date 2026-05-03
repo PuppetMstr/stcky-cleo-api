@@ -4,6 +4,8 @@
 // RUNG 4 — Corrections as superseding events (parseSupersedesFromValue +
 //          supersedes_keys in memoryToCanonical's meta; inert unless
 //          RUNG_4_MODE is set in associative.js)
+// ORGANISM BETA — First-class kinds (now_state, bundle, handoff) with
+//          retrieval priority and metadata redirect support
 //
 // Normalizes the three legacy collections (cleo.memories, cleo.objects,
 // cleo.events) into a single canonical candidate envelope per Blob Substrate
@@ -78,6 +80,28 @@ function parseSupersedesFromValue(text) {
     }
   }
   return result.length > 0 ? result : null;
+}
+
+// --- ORGANISM BETA: points_to parsing (handoff redirect) -------------------
+// For category=handoff memories, parse points_to target from value text.
+// Format: Look for "points_to: <category>/<key>" line (case insensitive).
+// Returns {category, key} object or null if no valid target found.
+
+function parsePointsToFromValue(text) {
+  if (!text || typeof text !== 'string') return null;
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const m = line.match(/^\s*points_to:\s*(.+?)\s*$/i);
+    if (!m) continue;
+    const target = m[1].trim();
+    const slash = target.indexOf('/');
+    if (slash > 0 && slash < target.length - 1) {
+      const category = target.slice(0, slash).trim();
+      const key = target.slice(slash + 1).trim();
+      if (category && key) return { category, key };
+    }
+  }
+  return null;
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -225,6 +249,22 @@ function memoryToCanonical(mem) {
     ? parseSupersedesFromValue(payload)
     : null;
 
+  // ORGANISM BETA: determine kind and special properties for first-class organism categories
+  let kind = 'memory_promoted';
+  let retrieval_priority = null;
+  let points_to = null;
+  
+  if (mem.category === 'now') {
+    kind = 'now_state';
+    retrieval_priority = 'anchor'; // Always surface most recent regardless of semantic match
+  } else if (mem.category === 'bundle') {
+    kind = 'bundle';
+    // TODO: parse handle and members from payload for bundle-specific metadata
+  } else if (mem.category === 'handoff') {
+    kind = 'handoff';
+    points_to = parsePointsToFromValue(payload); // Parse "points_to: <target>" from value
+  }
+
   return {
     event_id: `mem_${id}`,
     seq: null,
@@ -234,7 +274,7 @@ function memoryToCanonical(mem) {
     actor: synthActorForMemory(mem),
     session_id: null,
     thread_id: null,
-    kind: 'memory_promoted',
+    kind,
     parent_event_id: null,
     call_id: null,
     fingerprint: null,
@@ -246,6 +286,8 @@ function memoryToCanonical(mem) {
     // Legacy memories have been indexed for months; assume complete.
     enrichment: { state: 'complete', artifacts: ['embedding:legacy'] },
     trust: SOURCE_PRIORS.memories,
+    retrieval_priority, // ORGANISM BETA: anchor priority for now_state
+    points_to, // ORGANISM BETA: redirect target for handoff
     meta: {
       source_collection: 'memories',
       legacy_id: id,
@@ -377,4 +419,7 @@ module.exports = {
 
   // RUNG 4: exported for unit tests
   parseSupersedesFromValue,
+  
+  // ORGANISM BETA: exported for unit tests  
+  parsePointsToFromValue,
 };

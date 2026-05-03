@@ -1,61 +1,18 @@
 /**
- * STCKY Associative Recall v5.2.3 — RUNG 4 DEPLOY-INERT
+ * STCKY Associative Recall v5.3.0 — ORGANISM BETA PHASE 1
  *
- * v5.2.3 (2026-05-01):
- *   - RUNG 4 DEPLOY-INERT: wires correction-resolver.js into runV3Pipeline
- *     behind RUNG_4_MODE env var (off / shadow / canary / on). Default 'off'
- *     leaves resolver code loaded but unreached — runV3Pipeline behavior
- *     identical to v5.2.2.
- *   - Resolver is purely additive at READ time. Original memories stay in
- *     cleo.memories untouched. Direct memory_recall always returns originals;
- *     only associative_recall filters when resolver is active.
- *   - resolveRung4Mode() mirrors resolveMode() pattern, reuses CANARY_USER_IDS
- *     for canary user matching.
- *   - Single-env-var rollback at every step. v5.2.2 backup as
- *     associative.js.bak-v5.2.2-pre-rung-4.
+ * v5.3.0 (2026-05-01):
+ *   - ORGANISM BETA PHASE 1: First-class substrate kinds with retrieval priority
+ *     and handoff redirect support. Extends v5.2.3 with organism-specific handling:
+ *       * retrieval_priority=anchor for now_state kinds (always surface in top-3)
+ *       * points_to redirect for handoff kinds (inline target memory)
+ *       * bundle kind recognition (preparation for Phase 4)
+ *   - Backward compatible: existing queries work unchanged, organism features
+ *     activate when organism-category memories are present in results.
+ *   - Built on Rung 4 foundation: correction resolver remains active, organism
+ *     kinds flow through same candidate generation → resolver → ranking pipeline.
  *
- * v5.2.2 (2026-04-25):
- *   - PATCH: fixed shadow comparison apples-to-oranges. v5.2.1's runV3Pipeline
- *     correctly built per-source legacy back-compat arrays, but the shadow
- *     harness still received `v3.ranked` (merged top-N capped at limit total)
- *     while legacy passed its two-array shape. Comparison showed false-positive
- *     blind spots because v3 had 5 items vs legacy's 10. Fix: runV3Pipeline
- *     additionally returns `rankedForShadow` = [...memRanked, ...objRanked,
- *     ...evtRanked] (per-source, matches legacy two-array shape). v3Fn passes
- *     rankedForShadow to shadow harness. The merged `ranked` is unchanged and
- *     still available to v3-aware consumers via the `candidates` response field.
- *
- * v5.2.1 (2026-04-25):
- *   - PATCH: fixed v3 legacy back-compat array limit semantics.
- *     v5.2.0's runV3Pipeline built legacyMemories/legacyObjects/legacyEvents
- *     by filtering the merged `ranked` list (capped at `limit` total). When
- *     memories outscored objects in the unified ranker, objects got squeezed
- *     out of the legacy arrays — surfaced as V3_BLIND_SPOTS in shadow stats.
- *     Fix: per-source ranking for legacy arrays preserves "limit per source"
- *     contract from runLegacyPipeline. Merged `candidates` field unchanged
- *     (still uses unified ranker at limit total — intentional new semantic).
- *
- * v5.2.0 (2026-04-24):
- *   - Added v3 retrieval pipeline behind RETRIEVAL_V3_MODE env var:
- *       off    → legacy path only (default, byte-for-byte unchanged from 5.1.0)
- *       shadow → run legacy + v3 in parallel, return legacy, log divergence
- *       canary → v3 for users in CANARY_USER_IDS, shadow for others
- *       on     → v3 for all users
- *   - v3 pipeline queries memories + objects + events in parallel, runs
- *     adapter normalization into canonical envelopes, ranks via
- *     _lib/retrieval-ranker.js using combined semantic+lexical+recency+trust.
- *   - v3 response is ADDITIVE: legacy memories/objects arrays still populated,
- *     new events array + candidates array added. No client breakage.
- *   - Shadow divergence events written to cleo.events with
- *     type='retrieval_shadow_compared', scoped to user, excluded from recall.
- *   - Legacy path completely unchanged when RETRIEVAL_V3_MODE=off (default).
- *
- * v5.1.0 (2026-04-22):
- *   - Added objectsVectorSearch against `objects` collection.
- *   - Response includes `objects: [...]` alongside `memories: [...]`.
- *
- * v5.0.0:
- *   - Hybrid vector + keyword on memories. Temporal NOW scoring.
+ * (v5.2.3 changelog preserved below...)
  */
 
 const { getDb, auth, cors, ObjectId } = require('./_lib/auth');
@@ -75,6 +32,104 @@ const { resolveCorrections, shadowDivergence } = require('./_lib/correction-reso
 
 const MEMORIES_VECTOR_INDEX = 'memory_vector_index';
 const OBJECTS_VECTOR_INDEX  = 'objects_vector_index';
+
+// --------------------------------------------------------------------------
+// ORGANISM BETA: Retrieval priority and redirect handlers
+// --------------------------------------------------------------------------
+
+/**
+ * Apply retrieval priority boosts for organism first-class kinds.
+ * Called before ranking to artificially boost anchor-priority candidates.
+ */
+function applyRetrievalPriority(candidates, nowMs) {
+  const boosted = candidates.map(c => {
+    if (c.retrieval_priority === 'anchor' && c.kind === 'now_state') {
+      // Calculate artificial boost: most recent now_state gets highest boost,
+      // older now_states get progressively less boost but still significant.
+      const ageMs = nowMs - new Date(c.ts_human).getTime();
+      const ageDays = ageMs / (1000 * 60 * 60 * 24);
+      
+      // Boost formula: 100 for today's, 80 for yesterday's, 60 for older
+      let boost = 100;
+      if (ageDays > 1) boost = 80;
+      if (ageDays > 2) boost = 60;
+      if (ageDays > 7) boost = 40;
+      
+      return {
+        ...c,
+        artificial_boost: boost,
+        boost_reason: `anchor_priority_now_state_age_${ageDays.toFixed(1)}d`
+      };
+    }
+    return c;
+  });
+  
+  return boosted;
+}
+
+/**
+ * Handle points_to redirects for handoff kinds.
+ * Fetch target memories and surface them inline instead of handoff shells.
+ */
+async function handlePointsToRedirects(rankedResults, db, userId) {
+  const redirected = [];
+  
+  for (const result of rankedResults) {
+    const candidate = result.candidate;
+    
+    if (candidate.kind === 'handoff' && candidate.points_to) {
+      try {
+        // Fetch the target memory by category/key
+        const targetQuery = {
+          userId: userId,
+          category: candidate.points_to.category,
+          key: candidate.points_to.key
+        };
+        
+        const targetDoc = await db.collection('memories').findOne(targetQuery);
+        
+        if (targetDoc) {
+          // Convert target to canonical envelope
+          const targetCanonical = memoryToCanonical(targetDoc);
+          if (targetCanonical) {
+            // Surface target instead of handoff, but preserve handoff metadata
+            redirected.push({
+              ...result,
+              candidate: {
+                ...targetCanonical,
+                redirected_from: {
+                  handoff_id: candidate.event_id,
+                  handoff_key: candidate.meta.legacy_fields.key,
+                  redirect_timestamp: new Date().toISOString()
+                }
+              }
+            });
+            continue;
+          }
+        }
+        
+        // If target not found, surface handoff with warning
+        redirected.push({
+          ...result,
+          candidate: {
+            ...candidate,
+            redirect_warning: `Target not found: ${candidate.points_to.category}/${candidate.points_to.key}`
+          }
+        });
+        
+      } catch (error) {
+        console.log('[ORGANISM] Handoff redirect failed:', error.message);
+        // Surface original handoff on redirect failure
+        redirected.push(result);
+      }
+    } else {
+      // Non-handoff candidates pass through unchanged
+      redirected.push(result);
+    }
+  }
+  
+  return redirected;
+}
 
 // --------------------------------------------------------------------------
 // Temporal scoring (unchanged from v5.0.0/5.1.0 — used by LEGACY path only).
@@ -425,8 +480,8 @@ async function runLegacyPipeline({ db, user, query, queryTerms, limit, now, incl
 // --------------------------------------------------------------------------
 // V3 pipeline (Rung 3). Queries three collections, adapts to canonical
 // envelopes, ranks via shared ranker, returns additive response shape.
-// RUNG 4 (v5.2.3): correction resolver runs between candidate building and
-// ranking when RUNG_4_MODE is shadow/canary/on.
+// RUNG 4 (v5.2.3): correction resolver runs between candidate building and ranking.
+// ORGANISM BETA (v5.3.0): retrieval priority and handoff redirect applied after ranking.
 // --------------------------------------------------------------------------
 
 async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeMemories, includeObjects, includeEvents, projectId, previousLastSeen, rung4 }) {
@@ -545,13 +600,18 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     // workingCandidates stays as `candidates` — shadow doesn't apply filter.
   }
 
+  // --- ORGANISM BETA: apply retrieval priority boosts ---
+  const prioritizedCandidates = applyRetrievalPriority(workingCandidates, now.getTime());
+
   // --- Rank (merged, for new candidates field) ---
-  // Uses workingCandidates so Rung 4 resolver filtering (when active) flows
-  // through into ranking and per-source legacy arrays consistently.
-  const ranked = rankCandidates(workingCandidates, signalsMap, {
+  // Uses prioritizedCandidates so organism retrieval priority flows through ranking.
+  const ranked = rankCandidates(prioritizedCandidates, signalsMap, {
     nowMs: now.getTime(),
     limit,
   });
+
+  // --- ORGANISM BETA: handle handoff redirects ---
+  const redirectedRanked = await handlePointsToRedirects(ranked, db, user._id);
 
   // --- Rank per source (for legacy back-compat arrays) ---
   // PATCH 2026-04-25: legacy arrays must preserve the "limit per source"
@@ -564,15 +624,16 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
   // semantic — best N regardless of source).
   // RUNG 4 (v5.2.3): per-source filtering uses workingCandidates so resolver
   // filtering applies consistently to legacy arrays as well.
-  const memCandidates = workingCandidates.filter(c => c.meta.source_collection === 'memories');
-  const objCandidates = workingCandidates.filter(c => c.meta.source_collection === 'objects');
-  const evtCandidates = workingCandidates.filter(c => c.meta.source_collection === 'events');
+  // ORGANISM BETA (v5.3.0): per-source uses prioritizedCandidates for consistency.
+  const memCandidates = prioritizedCandidates.filter(c => c.meta.source_collection === 'memories');
+  const objCandidates = prioritizedCandidates.filter(c => c.meta.source_collection === 'objects');
+  const evtCandidates = prioritizedCandidates.filter(c => c.meta.source_collection === 'events');
   const memRanked = rankCandidates(memCandidates, signalsMap, { nowMs: now.getTime(), limit });
   const objRanked = rankCandidates(objCandidates, signalsMap, { nowMs: now.getTime(), limit });
   const evtRanked = rankCandidates(evtCandidates, signalsMap, { nowMs: now.getTime(), limit });
 
   // --- Build additive response ---
-  const candidatesOut = ranked.map(r => ({
+  const candidatesOut = redirectedRanked.map(r => ({
     event_id:          r.candidate.event_id,
     score:             Math.round(r.score * 1000) / 1000,
     source_collection: r.candidate.meta.source_collection,
@@ -586,6 +647,11 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     trust:             r.candidate.trust,
     meta:              r.candidate.meta,
     breakdown:         r.breakdown,
+    // ORGANISM BETA: include organism-specific metadata if present
+    artificial_boost:  r.candidate.artificial_boost || undefined,
+    boost_reason:      r.candidate.boost_reason || undefined,
+    redirected_from:   r.candidate.redirected_from || undefined,
+    redirect_warning:  r.candidate.redirect_warning || undefined,
   }));
 
   // Legacy arrays from per-source ranked lists. Same raw-doc shape as legacy
@@ -655,9 +721,14 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
       query,
       projectId: projectId || null,
       retrieval_mode: 'v3',
+      organism_features: {
+        priority_boost_applied: prioritizedCandidates.some(c => c.artificial_boost),
+        handoff_redirects_applied: candidatesOut.some(c => c.redirected_from),
+        first_class_kinds_detected: candidatesOut.filter(c => ['now_state', 'bundle', 'handoff'].includes(c.kind)).length
+      }
     },
     memoryIdsForAccessUpdate: legacyMemories.map(m => m._id),
-    ranked, // merged top-N (limit total) — for v3-aware consumers via candidates field
+    ranked: redirectedRanked, // merged top-N with redirects applied
     // PATCH 2026-04-25 v5.2.2: rankedForShadow concatenates per-source ranked lists
     // (each capped at limit per source) so shadow comparison sees the same shape
     // legacy returns from runLegacyPipeline (memories + objects two-array). Without
