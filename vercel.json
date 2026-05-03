@@ -6,6 +6,10 @@
                        "use":  "@vercel/node"
                    },
                    {
+                       "src":  "heartbeat.js",
+                       "use":  "@vercel/node"
+                   },
+                   {
                        "src":  "memory.js",
                        "use":  "@vercel/node"
                    },
@@ -99,6 +103,10 @@
                    {
                        "src":  "/api/ingest",
                        "dest":  "/ingest.js"
+                   },
+                   {
+                       "src":  "/api/cron/heartbeat",
+                       "dest":  "/heartbeat.js"
                    },
                    {
                        "src":  "/api/health/deep",
@@ -208,5 +216,11 @@
                        "src":  "/api/stripe/webhook",
                        "dest":  "/stripe.js"
                    }
-               ]
+               ],
+    "crons":  [
+                  {
+                      "path":  "/api/cron/heartbeat",
+                      "schedule":  "0 * * * *"
+                  }
+              ]
 }
