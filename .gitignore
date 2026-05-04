@@ -1,21 +1,43 @@
+# Node
 node_modules/
-.env
-.env.local
-.vercel/
-*.log
-.DS_Store
-.vercel
-.env*.local
+package-lock.json
 
-# Local backup files (pattern established 2026-04-22)
-# We intentionally keep timestamped backups locally when editing production files,
-# but these should never be committed. Git history is the proper versioning layer.
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Versioned scratch snapshots
+*.v*-unstaged
 *.bak
 *.bak-*
-*.backup
+*.js.v*
 *.backup-*
 
-# Stray empties from terminal output that accidentally got interpreted as commands
-# (happened a few times on 2026-04-22 when cmd output got pasted back into cmd)
-/git
-/main
+# Vercel
+.vercel/
+
+# One-off probe / smoke / audit / rotate scripts
+audit-*.cjs
+check-*.cjs
+rotate-*.cjs
+smoke-*.cjs
+
+# Diff snapshots
+diff-*.json
+diff*.txt
+shadow-diff-*.json
+
+# Local spec drafts (commit to repo only when finalized as docs/)
+*-spec.md
+
+# Stray accidental files
+git
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
