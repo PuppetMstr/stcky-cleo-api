@@ -25,6 +25,7 @@ function getAction(url) {
   if (url.includes('/memory/list')) return 'list';
   if (url.includes('/memory/search')) return 'search';
   if (url.includes('/memory/upcoming')) return 'upcoming';
+  if (url.includes('/memory/recent')) return 'recent';
   if (url.includes('/memory/anchors')) return 'anchors';
   return 'crud';
 }
@@ -188,6 +189,59 @@ module.exports = async (req, res) => {
         memories: results,
         count: results.length,
         window: { from: now.toISOString(), to: futureDate.toISOString() },
+        projectId: projectId || null
+      });
+    }
+
+    // ============ RECENT (v4.18.0) ============
+    // Structural query for the recent-substrate wake-up slice.
+    // Mirrors the upcoming-action shape but on updatedAt with a backward window
+    // and an optional category-IN filter. No semantic search. Per
+    // vision/recent-substrate-as-primary-wake-up-surface-2026-05-06.
+    if (action === 'recent') {
+      const { hours = '36', categories, limit = '50', projectId } = req.query;
+
+      const hoursNum = Math.max(1, Math.min(parseInt(hours) || 36, 168)); // cap at 7 days
+      const limitNum = Math.max(1, Math.min(parseInt(limit) || 50, 200));
+      const cutoffDate = new Date(Date.now() - hoursNum * 60 * 60 * 1000);
+      const nowDate = new Date();
+
+      let baseQuery;
+      if (projectId) {
+        const project = await db.collection('projects').findOne({
+          _id: new ObjectId(projectId),
+          $or: [{ ownerId: user._id }, { memberIds: user._id }]
+        });
+        if (!project) return res.status(403).json({ error: 'No access to this project' });
+        baseQuery = { projectId: new ObjectId(projectId) };
+      } else {
+        baseQuery = { userId: user._id };
+      }
+
+      const query = {
+        ...baseQuery,
+        updatedAt: { $gte: cutoffDate }
+      };
+
+      let categoryList = null;
+      if (categories) {
+        categoryList = categories.split(',').map(c => c.trim()).filter(Boolean);
+        if (categoryList.length > 0) {
+          query.category = { $in: categoryList };
+        }
+      }
+
+      const results = await db.collection('memories')
+        .find(query)
+        .sort({ updatedAt: -1 })
+        .limit(limitNum)
+        .toArray();
+
+      return res.json({
+        memories: results,
+        count: results.length,
+        window: { from: cutoffDate.toISOString(), to: nowDate.toISOString(), hours: hoursNum },
+        categories: categoryList,
         projectId: projectId || null
       });
     }
