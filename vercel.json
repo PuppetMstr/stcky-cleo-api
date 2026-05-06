@@ -43,6 +43,7 @@
     { "src": "/api/memory/list", "dest": "/memory.js" },
     { "src": "/api/memory/search", "dest": "/memory.js" },
     { "src": "/api/memory/upcoming", "dest": "/memory.js" },
+    { "src": "/api/memory/recent", "dest": "/memory.js" },
     { "src": "/api/memory", "dest": "/memory.js" },
     { "src": "/api/associative", "dest": "/associative.js" },
     { "src": "/api/enrich", "dest": "/enrich.js" },
