@@ -111,13 +111,13 @@ async function recent(req, res, db, user) {
   // Over-fetch so post-filter still has enough to fill the cap.
   const overFetch = Math.min(200, limit * 5);
 
-  // cleo.objects stores userId as a STRING and uses `ingested_at` as the
-  // write-time field (no createdAt). user._id is an ObjectId, so stringify.
-  const userIdStr = String(user._id);
+  // cleo.objects stores userId as ObjectId and ingested_at as Date
+  // (verified across all 1659 docs via peek-objects-types-v2).
+  // Pass user._id (already ObjectId from auth) and since (Date) directly.
   const raw = await db.collection('objects')
     .find({
-      userId: userIdStr,
-      ingested_at: { $gte: since.toISOString() },
+      userId: user._id,
+      ingested_at: { $gte: since },
     })
     .sort({ ingested_at: -1 })
     .limit(overFetch)
