@@ -63,10 +63,10 @@ function filterNoise(objects) {
     const sourceType = obj.source_type;
     const meta = obj.metadata || {};
     const toolName = meta.tool_name;
-    const speaker = meta.speaker || 'unknown';
-    const ts = obj.createdAt instanceof Date
-      ? obj.createdAt
-      : new Date(obj.createdAt || obj.timestamp || 0);
+    const speaker = obj.speaker || meta.speaker || 'unknown';
+    const ts = obj.ingested_at instanceof Date
+      ? obj.ingested_at
+      : new Date(obj.ingested_at || obj.timestamp || 0);
 
     // Drop noisy tool_events outright.
     if (sourceType === 'tool_event' && toolName && NOISY_TOOLS.has(toolName)) {
@@ -111,12 +111,15 @@ async function recent(req, res, db, user) {
   // Over-fetch so post-filter still has enough to fill the cap.
   const overFetch = Math.min(200, limit * 5);
 
+  // cleo.objects stores userId as a STRING and uses `ingested_at` as the
+  // write-time field (no createdAt). user._id is an ObjectId, so stringify.
+  const userIdStr = String(user._id);
   const raw = await db.collection('objects')
     .find({
-      userId: user._id,
-      createdAt: { $gte: since },
+      userId: userIdStr,
+      ingested_at: { $gte: since.toISOString() },
     })
-    .sort({ createdAt: -1 })
+    .sort({ ingested_at: -1 })
     .limit(overFetch)
     .toArray();
 
@@ -126,12 +129,12 @@ async function recent(req, res, db, user) {
   // and a short content snippet. Don't return embeddings or full payloads.
   const slim = filtered.map(obj => ({
     _id: String(obj._id),
-    createdAt: obj.createdAt,
+    ingested_at: obj.ingested_at || null,
     timestamp: obj.timestamp || null,
     source_type: obj.source_type,
-    speaker: (obj.metadata && obj.metadata.speaker) || null,
+    speaker: obj.speaker || (obj.metadata && obj.metadata.speaker) || null,
     tool_name: (obj.metadata && obj.metadata.tool_name) || null,
-    session_id: (obj.metadata && obj.metadata.session_id) || null,
+    session_id: obj.session_id || (obj.metadata && obj.metadata.session_id) || null,
     content_snippet: typeof obj.content === 'string'
       ? obj.content.slice(0, 200)
       : null,
