@@ -241,10 +241,6 @@
     {
       "path": "/api/cron/heartbeat",
       "schedule": "0 * * * *"
-    },
-    {
-      "path": "/api/cron/now-state-synthesis",
-      "schedule": "0 6 * * *"
     }
   ]
 }
