@@ -351,7 +351,14 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ redirect: redirectUrl.toString() });
       } else {
         const user = await users.findOne({ email: email.toLowerCase() });
-        if (!user || (user.password !== password && user.apiKey !== password)) return res.status(401).json({ error: 'Invalid email or password' });
+        // PATCHED 2026-05-13: login accepts passwordHash (new) + legacy plaintext + apiKey
+        const inputHash = hashPassword(password);
+        const authOk = user && (
+          (user.passwordHash && user.passwordHash === inputHash) ||
+          (user.password && user.password === password) ||
+          (user.apiKey && user.apiKey === password)
+        );
+        if (!authOk) return res.status(401).json({ error: 'Invalid email or password' });
         
         const authCode = 'stcky_code_' + Buffer.from(JSON.stringify({ userId: user._id.toString(), exp: Date.now() + 600000 })).toString('base64');
         const redirectUrl = new URL(redirect_uri);
