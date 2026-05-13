@@ -2,6 +2,10 @@
   "version": 2,
   "builds": [
     {
+      "src": "v1-read.js",
+      "use": "@vercel/node"
+    },
+    {
       "src": "health.js",
       "use": "@vercel/node"
     },
@@ -92,6 +96,10 @@
     }
   ],
   "routes": [
+   {
+      "src": "/v1/read",
+      "dest": "/v1-read.js"
+    },
     {
       "src": "/api/federation/ask",
       "dest": "/federation.js"

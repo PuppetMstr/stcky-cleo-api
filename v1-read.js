@@ -62,10 +62,26 @@ function trimObject(o) {
 // ============ MODE: NOW ============
 // NOW-anchored corpus pull. Parallel fan-out across curated (memories)
 // and raw (objects), merged time-descending.
-async function fanOutNow(db, user, hours, limit, include) {
+async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWindowDays) {
+  // PATCHED 2026-05-13: movable-now bounded window
   const hoursNum = Math.max(1, Math.min(parseInt(hours) || 24, 168));
   const limitNum = Math.max(1, Math.min(parseInt(limit) || 30, 200));
-  const since = new Date(Date.now() - hoursNum * 60 * 60 * 1000);
+  const maxDays = Math.max(1, Math.min(parseInt(maxWindowDays) || 90, 365));
+
+  // Upper bound (the "anchor NOW"): cursor (before) > explicit anchor > current NOW
+  const upperBound = before ? new Date(before) : (anchor ? new Date(anchor) : new Date());
+
+  // Lower bound: upperBound - hoursNum, clamped to maxDays back from current NOW
+  const earliestAllowed = new Date(Date.now() - maxDays * 24 * 60 * 60 * 1000);
+  let lowerBound = new Date(upperBound.getTime() - hoursNum * 60 * 60 * 1000);
+  let exhaustedWindow = false;
+  if (lowerBound < earliestAllowed) {
+    lowerBound = earliestAllowed;
+    exhaustedWindow = true;
+  }
+
+  // Strict less-than when paginating via cursor; inclusive otherwise
+  const upperOp = before ? '$lt' : '$lte';
 
   const inc = {
     curated: include.curated !== false,
@@ -76,7 +92,7 @@ async function fanOutNow(db, user, hours, limit, include) {
   const [memoryDocs, objectDocs] = await Promise.all([
     inc.curated
       ? db.collection('memories')
-          .find({ userId: user._id, updatedAt: { $gte: since } })
+          .find({ userId: user._id, updatedAt: { $gte: lowerBound, [upperOp]: upperBound } })
           .sort({ updatedAt: -1 })
           .limit(limitNum)
           .toArray()
@@ -85,7 +101,7 @@ async function fanOutNow(db, user, hours, limit, include) {
       ? db.collection('objects')
           .find({
             userId: user._id,
-            ingested_at: { $gte: since },
+            ingested_at: { $gte: lowerBound, [upperOp]: upperBound },
             ...(inc.events ? {} : { 'metadata.event_type': { $ne: 'tool_event' } }),
           })
           .sort({ ingested_at: -1 })
@@ -100,10 +116,15 @@ async function fanOutNow(db, user, hours, limit, include) {
     ...objectDocs.map(o => ({ kind: 'object', ts: o.ingested_at, doc: o })),
   ].sort((a, b) => b.ts - a.ts).slice(0, limitNum);
 
+  // Cursor: timestamp of the oldest returned item, for the next page call
+  const cursor = merged.length > 0 ? merged[merged.length - 1].ts.toISOString() : null;
+
   return {
     memories: merged.filter(x => x.kind === 'memory').map(x => trimMemory(x.doc)),
     objects: merged.filter(x => x.kind === 'object').map(x => trimObject(x.doc)),
-    window: { from: since.toISOString(), to: new Date().toISOString(), hours: hoursNum },
+    window: { from: lowerBound.toISOString(), to: upperBound.toISOString(), hours: hoursNum, max_window_days: maxDays },
+    cursor,
+    exhausted_window: exhaustedWindow,
   };
 }
 
@@ -190,27 +211,42 @@ async function byThread(db, user, thread, limit) {
 
 // ============ MODE: RAW_RECENT ============
 // Raw objects only, NOW-anchored. Skips curated entirely.
-async function rawRecent(db, user, hours, limit, include) {
+async function rawRecent(db, user, hours, limit, include, anchor, before, maxWindowDays) {
+  // PATCHED 2026-05-13: movable-now bounded window
   const hoursNum = Math.max(1, Math.min(parseInt(hours) || 24, 168));
   const limitNum = Math.max(1, Math.min(parseInt(limit) || 30, 200));
-  const since = new Date(Date.now() - hoursNum * 60 * 60 * 1000);
+  const maxDays = Math.max(1, Math.min(parseInt(maxWindowDays) || 90, 365));
+
+  const upperBound = before ? new Date(before) : (anchor ? new Date(anchor) : new Date());
+  const earliestAllowed = new Date(Date.now() - maxDays * 24 * 60 * 60 * 1000);
+  let lowerBound = new Date(upperBound.getTime() - hoursNum * 60 * 60 * 1000);
+  let exhaustedWindow = false;
+  if (lowerBound < earliestAllowed) {
+    lowerBound = earliestAllowed;
+    exhaustedWindow = true;
+  }
+  const upperOp = before ? '$lt' : '$lte';
 
   const inc = { events: include.events === true };
 
   const objectDocs = await db.collection('objects')
     .find({
       userId: user._id,
-      ingested_at: { $gte: since },
+      ingested_at: { $gte: lowerBound, [upperOp]: upperBound },
       ...(inc.events ? {} : { 'metadata.event_type': { $ne: 'tool_event' } }),
     })
     .sort({ ingested_at: -1 })
     .limit(limitNum)
     .toArray();
 
+  const cursor = objectDocs.length > 0 ? objectDocs[objectDocs.length - 1].ingested_at.toISOString() : null;
+
   return {
     memories: [],
     objects: objectDocs.map(trimObject),
-    window: { from: since.toISOString(), to: new Date().toISOString(), hours: hoursNum },
+    window: { from: lowerBound.toISOString(), to: upperBound.toISOString(), hours: hoursNum, max_window_days: maxDays },
+    cursor,
+    exhausted_window: exhaustedWindow,
   };
 }
 
@@ -247,13 +283,16 @@ module.exports = async (req, res) => {
     hours = 24,
     limit,
     include = {},
+    anchor,            // PATCHED 2026-05-13
+    before,            // PATCHED 2026-05-13 — cursor for pagination
+    max_window_days,   // PATCHED 2026-05-13 — outer wall, default 90
   } = body;
 
   try {
     let result;
     switch (mode) {
       case 'now':
-        result = await fanOutNow(db, user, hours, limit, include);
+        result = await fanOutNow(db, user, hours, limit, include, anchor, before, max_window_days);
         break;
       case 'semantic':
         if (!query) {
@@ -274,7 +313,7 @@ module.exports = async (req, res) => {
         result = await byThread(db, user, thread, limit);
         break;
       case 'raw_recent':
-        result = await rawRecent(db, user, hours, limit, include);
+        result = await rawRecent(db, user, hours, limit, include, anchor, before, max_window_days);
         break;
       default:
         return res.status(400).json({ error: `unknown mode: ${mode}` });
