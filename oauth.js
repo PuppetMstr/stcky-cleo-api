@@ -55,10 +55,13 @@ module.exports = async function handler(req, res) {
       const now = new Date();
       
       // Create user
+      // PATCHED 2026-05-13: name on user doc
       const user = {
         email: email.toLowerCase(),
         passwordHash: hashPassword(password),
         apiKey,
+        firstName: (profile && typeof profile === 'object' && profile.firstName) || '',
+        lastName:  (profile && typeof profile === 'object' && profile.lastName)  || '',
         plan: 'free',
         memoryCount: 0,
         memoryLimit: 100,
