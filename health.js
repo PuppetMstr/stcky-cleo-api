@@ -3,10 +3,8 @@ const { getDb, auth, cors } = require('./_lib/auth');
 module.exports = async (req, res) => {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
-
   const isDeep = req.url.includes('/deep') || req.query.deep === 'true';
   const version = '4.5.0';
-
   // Shallow health - just confirms server is running
   if (!isDeep) {
     return res.status(200).json({
@@ -38,39 +36,56 @@ module.exports = async (req, res) => {
       timestamp: new Date().toISOString()
     });
   }
-
   // Deep health - actually tests auth, db, read, write
+  //
+  // Patch (2026-05-17, Eli): distinguishes "no credentials provided"
+  // from "credentials provided but invalid". Anonymous monitors hitting
+  // this endpoint without a key now get 200 + db reachability signal
+  // instead of opaque 503. A real auth failure (someone passed a key
+  // and it didn't resolve) still returns 503 with auth.status='fail'.
+  // Closes finding/auth-cascade-confirmed-fixed-plus-health-and-dep0169-
+  // 2026-05-17 side finding #1.
+  const hasAuthAttempt = !!(
+    req.headers['authorization'] ||
+    req.headers['x-api-key'] ||
+    (req.query && req.query.apiKey)
+  );
+
   const checks = {
     auth: { status: 'pending', ms: 0 },
     database: { status: 'pending', ms: 0 },
     read: { status: 'pending', ms: 0 },
     write: { status: 'pending', ms: 0 }
   };
-
   let overallStatus = 'ok';
   const startTime = Date.now();
-
   try {
     // Check 1: Auth
     const authStart = Date.now();
     const user = await auth(req);
     checks.auth.ms = Date.now() - authStart;
-    
+
     if (!user) {
-      checks.auth.status = 'fail';
-      checks.auth.error = 'No valid API key provided';
-      overallStatus = 'unhealthy';
+      if (hasAuthAttempt) {
+        // Credentials were sent but didn't resolve to a user. Real failure.
+        checks.auth.status = 'fail';
+        checks.auth.error = 'Invalid API key';
+        overallStatus = 'unhealthy';
+      } else {
+        // Anonymous health check. Skip auth-dependent verifications but
+        // still verify database reachability below.
+        checks.auth.status = 'skipped';
+        checks.auth.note = 'No credentials provided; running anonymous probe';
+      }
     } else {
       checks.auth.status = 'ok';
       checks.auth.userId = user._id.toString().slice(-6); // Last 6 chars only
     }
-
     // Check 2: Database connection
     const dbStart = Date.now();
     const db = await getDb();
     checks.database.ms = Date.now() - dbStart;
     checks.database.status = 'ok';
-
     // Check 3: Read canary memory
     if (user) {
       const readStart = Date.now();
@@ -103,12 +118,13 @@ module.exports = async (req, res) => {
       checks.write.ms = Date.now() - writeStart;
       checks.write.status = 'ok';
     } else {
+      // Either anonymous probe (skipped above) or auth-fail (overallStatus
+      // already 'unhealthy'). In both cases skip data-plane checks.
       checks.read.status = 'skip';
-      checks.read.reason = 'No auth';
+      checks.read.reason = hasAuthAttempt ? 'Auth failed' : 'No auth';
       checks.write.status = 'skip';
-      checks.write.reason = 'No auth';
+      checks.write.reason = hasAuthAttempt ? 'Auth failed' : 'No auth';
     }
-
   } catch (err) {
     overallStatus = 'unhealthy';
     const failedCheck = Object.keys(checks).find(k => checks[k].status === 'pending');
@@ -117,9 +133,7 @@ module.exports = async (req, res) => {
       checks[failedCheck].error = err.message;
     }
   }
-
   const totalMs = Date.now() - startTime;
-
   const response = {
     status: overallStatus,
     version,
@@ -127,7 +141,6 @@ module.exports = async (req, res) => {
     totalMs,
     timestamp: new Date().toISOString()
   };
-
   const httpStatus = overallStatus === 'ok' ? 200 : 503;
   return res.status(httpStatus).json(response);
 };
