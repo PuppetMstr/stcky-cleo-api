@@ -6,6 +6,10 @@
       "use": "@vercel/node"
     },
     {
+      "src": "v1-wake.js",
+      "use": "@vercel/node"
+    },
+    {
       "src": "health.js",
       "use": "@vercel/node"
     },
@@ -99,6 +103,10 @@
    {
       "src": "/v1/read",
       "dest": "/v1-read.js"
+    },
+    {
+      "src": "/v1/wake",
+      "dest": "/v1-wake.js"
     },
     {
       "src": "/api/federation/ask",
