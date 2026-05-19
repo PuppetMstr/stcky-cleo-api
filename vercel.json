@@ -87,6 +87,10 @@
       "use": "@vercel/node"
     },
     {
+      "src": "claim.js",
+      "use": "@vercel/node"
+    },
+    {
       "src": "admin-shadow-stats.js",
       "use": "@vercel/node"
     },
@@ -211,6 +215,10 @@
     {
       "src": "/api/auth/signup",
       "dest": "/oauth.js"
+    },
+    {
+      "src": "/api/claim",
+      "dest": "/claim.js"
     },
     {
       "src": "/api/oauth/authorize",
