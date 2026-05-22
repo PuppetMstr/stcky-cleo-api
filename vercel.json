@@ -101,10 +101,18 @@
     {
       "src": "objects.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "login.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "login-verify.js",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
-   {
+    {
       "src": "/v1/read",
       "dest": "/v1-read.js"
     },
@@ -219,6 +227,14 @@
     {
       "src": "/api/claim",
       "dest": "/claim.js"
+    },
+    {
+      "src": "/api/login/verify",
+      "dest": "/login-verify.js"
+    },
+    {
+      "src": "/api/login",
+      "dest": "/login.js"
     },
     {
       "src": "/api/oauth/authorize",

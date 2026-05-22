@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "mongodb": "^6.21.0",
+    "nodemailer": "^8.0.7",
     "openai": "^4.52.0",
     "stripe": "^14.0.0"
   }
