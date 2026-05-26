@@ -1,146 +1,177 @@
 // chat.js
-//
 // POST /api/chat — substrate-aware chat surface for stcky.ai users.
 //
-// Frontend contract (existing stcky.ai homepage):
-//   Body:    { turns: [{ role: 'user'|'sticky', text: string }, ...] }
-//   Returns: { reply: string, action: 'save_form'|null }
+// Two modes, branched on user.tier:
+//   - stateless (anonymous, basic, free): frontend is source of truth,
+//                                         server proxies to Anthropic, no persistence
+//   - substrate-aware (paid, founder):    full server-side loop with ingest +
+//                                         parallel recency+associative retrieval +
+//                                         web_search/web_fetch tools
 //
-// Modes (branched on identity.tier):
-//   - paid + founder:  substrate mode — ingest user turn, retrieve recency,
-//                      call Anthropic with web_search tool, ingest assistant turn
-//   - basic + anon:    stateless — frontend-provided turns are the only history,
-//                      no server-side persistence
+// Body shapes supported:
+//   { message: string, history?: [{role,content}] }                    // API contract
+//   { turns: [{role:'user'|'sticky'|'assistant', text:string}] }      // frontend contract
+//
+// Response (both shapes returned for caller compatibility):
+//   { response: string, reply: string, action: null }
+//
+// Auth: Authorization: Bearer cleo_...   (optional; presence + tier determines mode)
+//
+// Conventions:
+//   - CJS to match the rest of cleo-api (ingest.js, v1-read.js, admin-ingest.js)
+//   - Uses _lib/auth, _lib/objects, _lib/hybrid-search, _lib/system-prompt directly
+//   - No substrate.js indirection — same pattern as every other route handler
 
 const Anthropic = require('@anthropic-ai/sdk');
 const { getDb, auth, cors } = require('./_lib/auth');
 const { putObject } = require('./_lib/objects');
+const { searchHybrid } = require('./_lib/hybrid-search');
 const { buildSystemPrompt, STCKY_SURFACE } = require('./_lib/system-prompt');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const MODEL                 = 'claude-sonnet-4-5';
-const MAX_TOKENS            = 4096;
-const SUBSTRATE_RECENCY_MAX = 50;
-const CONTEXT_CHAR_BUDGET   = 16000;
-const MAX_TOOL_TURNS        = 8;
+// ─── Tunables ─────────────────────────────────────────────────
+const MODEL                       = 'claude-sonnet-4-6';
+const MAX_TOKENS                  = 4096;
+const SUBSTRATE_RECENCY_HOURS     = 36;
+const SUBSTRATE_RECENCY_LIMIT     = 50;
+const SUBSTRATE_ASSOCIATIVE_TOP_K = 8;
+const CONTEXT_CHAR_BUDGET         = 16000;   // ~4K tokens, leaves headroom
+const MAX_TOOL_TURNS              = 8;       // safety cap on tool-use iteration
+const SUBSTRATE_TIERS             = new Set(['paid', 'founder']);
 
-const SUBSTRATE_TOOLS = [
+// Built-in Anthropic tools enabled in paid mode.
+// NOTE: tool type identifiers are versioned — verify current strings at deploy time.
+const PAID_TOOLS = [
   { type: 'web_search_20250305', name: 'web_search' },
+  { type: 'web_fetch_20250915',  name: 'web_fetch'  },
 ];
 
-const SAVE_FORM_PROMPT_AFTER_TURNS = 6; // heuristic: suggest save after N substantive user turns
+const STATELESS_SYSTEM_PROMPT =
+  `You are a STCKY — a substrate-shaped conversational agent. ` +
+  `In this mode there is no persistent substrate yet; the user is exploring ` +
+  `you before signing in. Be warm, curious, helpful. Let them shape you. ` +
+  `Do not invent specifics about their life.`;
 
-const SYSTEM_PROMPT = `You are this user's STCKY - their substrate-shaped assistant.
-
-STCKY is a continuous pool of every turn the two of you have shared, ingested raw. You read the substrate to be more yourself with them, and every turn here flows back into it. The substrate is the engine; you are a surface.
-
-If a SUBSTRATE section is provided below, treat it as your memory of them - see by reading, not finding. If absent, you're new to each other; be warm and curious, let them shape you. Do not invent specifics about their life that aren't in the substrate or in this conversation.
-
-When you have web_search available, use it when the user's request needs information that isn't in their substrate - like contact info, regulations, current events, or specific facts. Combine substrate knowledge of who they are with live information about the world.`;
-
+// ─── Entry ────────────────────────────────────────────────────
 module.exports = async (req, res) => {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    const body = req.body || {};
-    const turns = Array.isArray(body.turns) ? body.turns : null;
-    // Back-compat: also accept { message, history } shape
-    const directMessage = typeof body.message === 'string' ? body.message : null;
-    const directHistory = Array.isArray(body.history) ? body.history : [];
-
-    let userMessage = null;
-    let priorMessages = [];
-
-    if (turns && turns.length > 0) {
-      const last = turns[turns.length - 1];
-      if (!last || last.role !== 'user' || typeof last.text !== 'string') {
-        return res.status(400).json({ error: 'last turn must be from user with text' });
-      }
-      userMessage = last.text;
-      priorMessages = turns.slice(0, -1).map(t => ({
-        role: t.role === 'sticky' || t.role === 'assistant' ? 'assistant' : 'user',
-        content: typeof t.text === 'string' ? t.text : (typeof t.content === 'string' ? t.content : ''),
-      })).filter(m => m.content.trim().length > 0);
-    } else if (directMessage) {
-      userMessage = directMessage;
-      priorMessages = directHistory;
-    } else {
-      return res.status(400).json({ error: 'turns or message required' });
-    }
-
-    if (!userMessage || userMessage.trim().length === 0) {
-      return res.status(400).json({ error: 'empty user message' });
+    const { message, history } = parseBody(req.body);
+    if (!message) {
+      return res.status(400).json({ error: 'message_required' });
     }
 
     const user = await auth(req);
-    const isPaid = user && ['paid', 'founder'].includes(user.tier);
+    const tier = user ? (user.tier || 'basic') : 'anonymous';
 
-    if (isPaid) {
-      const reply = await handleSubstrateMode({ user, message: userMessage });
-      return res.status(200).json({ reply, action: null });
+    if (user && SUBSTRATE_TIERS.has(tier)) {
+      return await handleSubstrateMode({ user, message, res });
     }
-
-    const reply = await handleStatelessMode({ message: userMessage, priorMessages });
-
-    // Heuristic save-form prompt: if visitor has spoken enough but isn't signed in
-    // (no Bearer token / no user), suggest the inline save form to claim.
-    const userTurnCount = turns ? turns.filter(t => t.role === 'user').length : 1;
-    const action = (!user && userTurnCount >= SAVE_FORM_PROMPT_AFTER_TURNS) ? 'save_form' : null;
-
-    return res.status(200).json({ reply, action });
+    return await handleStatelessMode({ message, history, res });
   } catch (err) {
-    console.error('[chat] error:', err.name, err.message);
-    return res.status(500).json({ error: 'internal_error', detail: err.message });
+    console.error('[chat] error:', err);
+    return res.status(500).json({ error: 'internal_error', details: err.message });
   }
 };
 
-async function handleStatelessMode({ message, priorMessages }) {
+// ─── Body parsing — supports both contracts ────────────────────
+function parseBody(body) {
+  body = body || {};
+  // Frontend contract: turns array
+  if (Array.isArray(body.turns)) {
+    const turns = body.turns;
+    // Last user turn is the message
+    const lastUser = [...turns].reverse().find(t => t && t.role === 'user');
+    if (!lastUser) return { message: null, history: [] };
+    const history = turns
+      .slice(0, turns.lastIndexOf(lastUser))
+      .filter(t => t && t.role && t.text)
+      .map(t => ({
+        role: t.role === 'sticky' ? 'assistant' : t.role,
+        content: t.text,
+      }));
+    return { message: lastUser.text, history };
+  }
+  // API contract: message + history
+  const message = typeof body.message === 'string' ? body.message : null;
+  const history = Array.isArray(body.history) ? body.history : [];
+  return { message, history };
+}
+
+// ─── Stateless mode (anonymous, basic, free) ───────────────────
+// Frontend is source of truth, server is pure relay. No persistence.
+async function handleStatelessMode({ message, history, res }) {
   const messages = [
-    ...priorMessages,
+    ...history,
     { role: 'user', content: message },
   ];
+
   const completion = await anthropic.messages.create({
     model: MODEL,
     max_tokens: MAX_TOKENS,
-    system: SYSTEM_PROMPT,
+    system: STATELESS_SYSTEM_PROMPT,
     messages,
   });
-  return extractText(completion);
+
+  const reply = extractText(completion);
+  return res.status(200).json({ response: reply, reply, action: null });
 }
 
-async function handleSubstrateMode({ user, message }) {
+// ─── Substrate mode (paid, founder) ────────────────────────────
+// Full loop: ingest user → parallel recency+associative pull → assemble system
+// prompt → call with tools (loop on tool_use) → ingest assistant.
+async function handleSubstrateMode({ user, message, res }) {
   const db = await getDb();
 
+  // 1. Ingest user turn first (persists even if downstream fails)
   await putObject(db, user._id, {
     content: message,
     source_type: 'conversation',
     speaker: `user:${user._id}`,
   });
 
-  const recentDesc = await db.collection('objects').find({
-    userId: user._id,
-  })
-  .sort({ ingested_at: -1 })
-  .limit(SUBSTRATE_RECENCY_MAX)
-  .toArray();
+  // 2. Parallel substrate pull — recency from objects, associative from both pools
+  const sinceMs = Date.now() - SUBSTRATE_RECENCY_HOURS * 3600 * 1000;
+  const lowerBound = new Date(sinceMs);
+  const [recentObjects, hybrid] = await Promise.all([
+    db.collection('objects')
+      .find({
+        userId: user._id,
+        ingested_at: { $gte: lowerBound },
+        'metadata.event_type': { $ne: 'tool_event' },
+      })
+      .sort({ ingested_at: -1 })
+      .limit(SUBSTRATE_RECENCY_LIMIT)
+      .toArray(),
+    searchHybrid(db, { userId: user._id }, message, {
+      limit: SUBSTRATE_ASSOCIATIVE_TOP_K,
+      includeMemories: true,
+      includeObjects: true,
+      now: new Date(),
+    }),
+  ]);
 
-  console.log(`[chat] substrate recency: ${recentDesc.length} objects for user ${user._id} (tier=${user.tier})`);
+  const substratePull = formatSubstrateContext(recentObjects, hybrid);
 
-  const recent = recentDesc.reverse();
-  const substrateContext = formatSubstrateContext(recent);
+  // 3. Assemble system prompt with persona + capability + substrate
+  const personaName  = user.personaName || (user.tier === 'founder' ? 'Eli' : '');
+  const userFirstName =
+    user.firstName ||
+    (user.name ? String(user.name).split(/\s+/)[0] : '') ||
+    '';
 
-  const systemWithSubstrate = buildSystemPrompt({
+  const systemPrompt = buildSystemPrompt({
+    personaName,
+    userFirstName,
+    substratePull,
     surface: STCKY_SURFACE,
-    personaName: (user && user.persona_name) ? String(user.persona_name)
-      : (user && user.api_key === 'cleo_eb2eaecd66f004eb0d25361675c5d637') ? 'Eli'
-      : null,
-    userFirstName: (user && user.name) ? String(user.name).split(/s+/)[0] : 'friend',
-    substratePull: substrateContext,
   });
 
+  // 4. Tool-use loop — keep calling until model says it's done
   let messages = [{ role: 'user', content: message }];
   let finalResponse = null;
 
@@ -148,36 +179,47 @@ async function handleSubstrateMode({ user, message }) {
     const completion = await anthropic.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
-      system: systemWithSubstrate,
+      system: systemPrompt,
       messages,
-      tools: SUBSTRATE_TOOLS,
+      tools: PAID_TOOLS,
     });
 
-    if (completion.stop_reason === 'end_turn' || completion.stop_reason === 'stop_sequence') {
+    if (completion.stop_reason === 'end_turn' ||
+        completion.stop_reason === 'stop_sequence') {
       finalResponse = completion;
       break;
     }
+
     if (completion.stop_reason === 'tool_use') {
+      // Anthropic's server-side tools (web_search, web_fetch) execute on the
+      // platform and return results inside completion.content. Append the
+      // assistant turn and continue the loop.
       messages.push({ role: 'assistant', content: completion.content });
       continue;
     }
+
+    // Unknown stop reason — return what we have rather than retry blindly
     finalResponse = completion;
     break;
   }
 
-  if (!finalResponse) throw new Error('tool_use_loop_exceeded_max_turns');
+  if (!finalResponse) {
+    throw new Error('tool_use_loop_exceeded_max_turns');
+  }
 
-  const responseText = extractText(finalResponse);
+  const reply = extractText(finalResponse);
 
+  // 5. Ingest assistant turn
   await putObject(db, user._id, {
-    content: responseText,
+    content: reply,
     source_type: 'conversation',
     speaker: 'stcky',
   });
 
-  return responseText;
+  return res.status(200).json({ response: reply, reply, action: null });
 }
 
+// ─── Helpers ──────────────────────────────────────────────────
 function extractText(completion) {
   return (completion.content || [])
     .filter(b => b.type === 'text')
@@ -185,22 +227,72 @@ function extractText(completion) {
     .join('\n');
 }
 
-function formatSubstrateContext(recent) {
-  if (!recent || recent.length === 0) {
-    return '(substrate is empty - be warm, let them shape you.)';
+// Merge recent objects + hybrid associative results into one substrate context
+// string. Dedup by _id; respect CONTEXT_CHAR_BUDGET hard stop. Recent first
+// (chronological), then "older context surfaced by this turn" from associative
+// results, then memories as a separate labeled section.
+function formatSubstrateContext(recentObjects, hybrid) {
+  const recent = Array.isArray(recentObjects) ? recentObjects : [];
+  const assocObjects = (hybrid && Array.isArray(hybrid.objects)) ? hybrid.objects : [];
+  const assocMemories = (hybrid && Array.isArray(hybrid.memories)) ? hybrid.memories : [];
+
+  if (recent.length === 0 && assocObjects.length === 0 && assocMemories.length === 0) {
+    return '(substrate is empty — be warm, let them shape you.)';
   }
-  const lines = ['## Recent conversation'];
+
+  const seen = new Set();
+  const lines = [];
   let chars = 0;
-  for (const obj of recent) {
-    const ts = obj.ingested_at
-      ? (typeof obj.ingested_at === 'string' ? obj.ingested_at : new Date(obj.ingested_at).toISOString())
-      : (obj.timestamp || '?');
-    const speaker = obj.speaker || 'unknown';
-    const content = obj.content || '';
-    const line = `[${ts}] ${speaker}: ${content}`;
-    if (chars + line.length > CONTEXT_CHAR_BUDGET) break;
-    lines.push(line);
-    chars += line.length;
+
+  // Section 1: recent conversation, oldest first for natural reading
+  if (recent.length > 0) {
+    lines.push('## Recent conversation (last 36h)');
+    for (const obj of [...recent].reverse()) {
+      const id = String(obj._id);
+      if (seen.has(id)) continue;
+      const ts = obj.timestamp || obj.ingested_at || '';
+      const line = `[${ts}] ${obj.speaker}: ${obj.content}`;
+      if (chars + line.length > CONTEXT_CHAR_BUDGET) break;
+      lines.push(line);
+      seen.add(id);
+      chars += line.length;
+    }
   }
+
+  // Section 2: older objects surfaced semantically (not already in recent)
+  if (chars < CONTEXT_CHAR_BUDGET && assocObjects.length > 0) {
+    const fresh = assocObjects.filter(o => !seen.has(String(o._id)));
+    if (fresh.length > 0) {
+      lines.push('');
+      lines.push('## Older context surfaced by this turn');
+      for (const obj of fresh) {
+        const id = String(obj._id);
+        const ts = obj.timestamp || obj.ingested_at || '';
+        const line = `[${ts}] ${obj.speaker}: ${obj.content}`;
+        if (chars + line.length > CONTEXT_CHAR_BUDGET) break;
+        lines.push(line);
+        seen.add(id);
+        chars += line.length;
+      }
+    }
+  }
+
+  // Section 3: curated memories surfaced semantically
+  if (chars < CONTEXT_CHAR_BUDGET && assocMemories.length > 0) {
+    lines.push('');
+    lines.push('## Relevant canon');
+    for (const mem of assocMemories) {
+      const id = String(mem._id);
+      if (seen.has(id)) continue;
+      const ts = mem.updatedAt || mem.createdAt || '';
+      const slug = `${mem.category || '?'}/${mem.key || '?'}`;
+      const line = `[${ts}] ${slug}: ${mem.value || ''}`;
+      if (chars + line.length > CONTEXT_CHAR_BUDGET) break;
+      lines.push(line);
+      seen.add(id);
+      chars += line.length;
+    }
+  }
+
   return lines.join('\n');
 }
