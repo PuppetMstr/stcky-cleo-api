@@ -99,6 +99,10 @@
       "use": "@vercel/node"
     },
     {
+      "src": "admin-ingest.js",
+      "use": "@vercel/node"
+    },
+    {
       "src": "objects.js",
       "use": "@vercel/node"
     },
@@ -109,9 +113,29 @@
     {
       "src": "login-verify.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "chat.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "migrate.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "referral.js",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
+    {
+      "src": "/api/chat",
+      "dest": "/chat.js"
+    },
+    {
+      "src": "/api/migrate",
+      "dest": "/migrate.js"
+    },
     {
       "src": "/v1/read",
       "dest": "/v1-read.js"
@@ -229,6 +253,10 @@
       "dest": "/claim.js"
     },
     {
+      "src": "/api/referral",
+      "dest": "/referral.js"
+    },
+    {
       "src": "/api/login/verify",
       "dest": "/login-verify.js"
     },
@@ -263,6 +291,10 @@
     {
       "src": "/api/admin/shadow-diff",
       "dest": "/admin-shadow-diff.js"
+    },
+    {
+      "src": "/api/admin/ingest",
+      "dest": "/admin-ingest.js"
     },
     {
       "src": "/api/stripe/checkout",
