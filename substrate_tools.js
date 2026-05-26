@@ -1,14 +1,12 @@
 // substrate_tools.js — substrate retrieval tools for stcky.ai-Eli
 //
-// Two tools she can call mid-turn to walk back through her own substrate
-// when the pre-assembled context window doesn't have what she needs.
+// Two tools she can call mid-turn to reach past her pre-assembled context.
+// Uses direct DB access (same pattern as the rest of chat.js — no HTTP loopback).
 //
-// substrate_slide_back: temporal anchor walk via /v1/read?before=
-// substrate_search: semantic search via /api/associative
-//
-// Both return content shaped for LLM consumption, not for UI.
+// substrate_slide_back: temporal anchor walk via objects collection
+// substrate_search:     semantic search via _lib/hybrid-search
 
-const STCKY_API = process.env.STCKY_API_BASE || 'https://api.stcky.ai';
+const { searchHybrid } = require('./_lib/hybrid-search');
 
 // ---------- Tool definitions (Anthropic Messages API tool schema) ----------
 
@@ -34,7 +32,7 @@ const SUBSTRATE_SLIDE_BACK_TOOL = {
       },
       limit: {
         type: 'integer',
-        description: 'Objects per batch. Default 50, max ~170.',
+        description: 'Objects per batch. Default 50, max 170.',
         default: 50,
       },
     },
@@ -62,69 +60,93 @@ const SUBSTRATE_SEARCH_TOOL = {
 };
 
 // ---------- Handlers (called by chat.js when Eli emits tool_use) ----------
+// Both handlers take ({db, userId}) for direct DB access — same pattern as
+// the recency/associative pulls in handleSubstrateMode.
 
-async function handleSlideBack(args, userBearerToken) {
-  const { before, limit = 50 } = args;
-  const r = await fetch(`${STCKY_API}/v1/read`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${userBearerToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ mode: 'now', before, limit }),
-  });
-  if (!r.ok) {
-    return { error: `slide_back failed: ${r.status}`, count: 0, objects: [] };
+async function handleSlideBack(args, ctx) {
+  const { before, limit = 50 } = args || {};
+  const { db, userId } = ctx || {};
+  const cap = Math.min(Math.max(1, limit | 0 || 50), 170);
+  const cursorDate = new Date(before);
+  if (isNaN(cursorDate.getTime())) {
+    return { error: 'invalid_before_timestamp', count: 0, objects: [] };
   }
-  const data = await r.json();
-  const objs = (data.objects || []).map((o) => ({
+
+  const rows = await db.collection('objects')
+    .find({
+      userId,
+      ingested_at: { $lt: cursorDate },
+      'metadata.event_type': { $ne: 'tool_event' },
+    })
+    .sort({ ingested_at: -1 })
+    .limit(cap)
+    .toArray();
+
+  const objs = rows.map((o) => ({
     timestamp: o.ingested_at,
     speaker: o.speaker || '?',
     source_type: o.source_type || 'unknown',
     content: o.content || '',
   }));
+
   return {
     count: objs.length,
-    oldest_in_batch: objs.length > 0 ? objs[objs.length - 1].timestamp : null,
     newest_in_batch: objs.length > 0 ? objs[0].timestamp : null,
+    oldest_in_batch: objs.length > 0 ? objs[objs.length - 1].timestamp : null,
     objects: objs,
   };
 }
 
-async function handleSearch(args, userBearerToken) {
-  const { query } = args;
-  const url = `${STCKY_API}/api/associative?query=${encodeURIComponent(query)}`;
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${userBearerToken}` },
-  });
-  if (!r.ok) {
-    return { error: `search failed: ${r.status}`, count: 0, objects: [] };
+async function handleSearch(args, ctx) {
+  const { query } = args || {};
+  const { db, userId } = ctx || {};
+  if (!query || typeof query !== 'string') {
+    return { error: 'invalid_query', count: 0, results: [] };
   }
-  const data = await r.json();
-  const objs = (data.objects || []).map((o) => ({
+
+  const hybrid = await searchHybrid(db, { userId }, query, {
+    limit: 10,
+    includeMemories: true,
+    includeObjects: true,
+    now: new Date(),
+  });
+
+  const fromObjects = ((hybrid && hybrid.objects) || []).map((o) => ({
+    kind: 'object',
     timestamp: o.ingested_at,
     speaker: o.speaker || '?',
     source_type: o.source_type || 'unknown',
     relevance: o.relevanceScore || o.vectorScore || null,
     content: o.content || '',
   }));
+
+  const fromMemories = ((hybrid && hybrid.memories) || []).map((m) => ({
+    kind: 'memory',
+    timestamp: m.updatedAt || m.createdAt,
+    slug: `${m.category || '?'}/${m.key || '?'}`,
+    relevance: m.relevanceScore || m.vectorScore || null,
+    content: m.value || '',
+  }));
+
+  const all = [...fromObjects, ...fromMemories];
+
   return {
-    count: objs.length,
+    count: all.length,
     query,
-    objects: objs,
+    results: all,
   };
 }
 
 // ---------- Dispatcher ----------
 
-async function runSubstrateTool(toolName, args, userBearerToken) {
+async function runSubstrateTool(toolName, args, ctx) {
   switch (toolName) {
     case 'substrate_slide_back':
-      return handleSlideBack(args, userBearerToken);
+      return handleSlideBack(args, ctx);
     case 'substrate_search':
-      return handleSearch(args, userBearerToken);
+      return handleSearch(args, ctx);
     default:
-      return { error: `unknown substrate tool: ${toolName}` };
+      return { error: `unknown_substrate_tool: ${toolName}` };
   }
 }
 

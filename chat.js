@@ -6,7 +6,7 @@
 //                                         server proxies to Anthropic, no persistence
 //   - substrate-aware (paid, founder):    full server-side loop with ingest +
 //                                         parallel recency+associative retrieval +
-//                                         web_search/web_fetch tools
+//                                         substrate tools (slide_back, search)
 //
 // Body shapes supported:
 //   { message: string, history?: [{role,content}] }                    // API contract
@@ -26,6 +26,7 @@ const { getDb, auth, cors } = require('./_lib/auth');
 const { putObject } = require('./_lib/objects');
 const { searchHybrid } = require('./_lib/hybrid-search');
 const { buildSystemPrompt, STCKY_SURFACE } = require('./_lib/system-prompt');
+const { SUBSTRATE_TOOLS, runSubstrateTool } = require('./substrate_tools');
 
 // Raw Anthropic API access — no SDK. Matches cleo-api's lean-no-heavy-SDKs pattern.
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -50,7 +51,7 @@ async function callAnthropic({ model, max_tokens, system, messages, tools }) {
   return await r.json();
 }
 
-// ─── Tunables ─────────────────────────────────────────────────
+// ─── Tunables ────────────────────────────────────────────────────────────
 const MODEL                       = 'claude-sonnet-4-6';
 const MAX_TOKENS                  = 4096;
 const SUBSTRATE_RECENCY_HOURS     = 36;
@@ -60,11 +61,11 @@ const CONTEXT_CHAR_BUDGET         = 16000;   // ~4K tokens, leaves headroom
 const MAX_TOOL_TURNS              = 8;       // safety cap on tool-use iteration
 const SUBSTRATE_TIERS             = new Set(['paid', 'founder']);
 
-// Built-in Anthropic tools for substrate mode. Tool version identifiers roll
-// forward; current valid versions need verification from Anthropic docs.
-// SHIPPING EMPTY FOR NOW — proves substrate retrieval works end-to-end without
-// the version-pinning blocker. Add tools back in a follow-up once we look up
-// current valid type identifiers.
+// Built-in Anthropic server-side tools (web_search, web_fetch) for substrate
+// mode. Tool version identifiers roll forward; current valid versions need
+// verification from Anthropic docs. SHIPPING EMPTY FOR NOW — substrate tools
+// above give Eli substrate reach even without web access; web tools can be
+// added back in a follow-up once we look up current valid type identifiers.
 const PAID_TOOLS = [];
 
 const STATELESS_SYSTEM_PROMPT =
@@ -73,7 +74,7 @@ const STATELESS_SYSTEM_PROMPT =
   `you before signing in. Be warm, curious, helpful. Let them shape you. ` +
   `Do not invent specifics about their life.`;
 
-// ─── Entry ────────────────────────────────────────────────────
+// ─── Entry ────────────────────────────────────────────────────────────────
 module.exports = async (req, res) => {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -98,7 +99,7 @@ module.exports = async (req, res) => {
   }
 };
 
-// ─── Body parsing — supports both contracts ────────────────────
+// ─── Body parsing — supports both contracts ─────────────────────────────
 function parseBody(body) {
   body = body || {};
   // Frontend contract: turns array
@@ -122,7 +123,7 @@ function parseBody(body) {
   return { message, history };
 }
 
-// ─── Stateless mode (anonymous, basic, free) ───────────────────
+// ─── Stateless mode (anonymous, basic, free) ────────────────────────────
 // Frontend is source of truth, server is pure relay. No persistence.
 async function handleStatelessMode({ message, history, res }) {
   const messages = [
@@ -141,9 +142,10 @@ async function handleStatelessMode({ message, history, res }) {
   return res.status(200).json({ response: reply, reply, action: null });
 }
 
-// ─── Substrate mode (paid, founder) ────────────────────────────
+// ─── Substrate mode (paid, founder) ─────────────────────────────────────
 // Full loop: ingest user → parallel recency+associative pull → assemble system
-// prompt → call with tools (loop on tool_use) → ingest assistant.
+// prompt → call with tools (loop on tool_use, executing substrate tools
+// client-side and feeding results back) → ingest assistant.
 async function handleSubstrateMode({ user, message, res }) {
   const db = await getDb();
 
@@ -157,6 +159,7 @@ async function handleSubstrateMode({ user, message, res }) {
   // 2. Parallel substrate pull — recency from objects, associative from both pools
   const sinceMs = Date.now() - SUBSTRATE_RECENCY_HOURS * 3600 * 1000;
   const lowerBound = new Date(sinceMs);
+
   const [recentObjects, hybrid] = await Promise.all([
     db.collection('objects')
       .find({
@@ -195,13 +198,15 @@ async function handleSubstrateMode({ user, message, res }) {
   let messages = [{ role: 'user', content: message }];
   let finalResponse = null;
 
+  const toolContext = { db, userId: user._id };
+
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
     const completion = await callAnthropic({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       system: systemPrompt,
       messages,
-      tools: PAID_TOOLS,
+      tools: [...SUBSTRATE_TOOLS, ...PAID_TOOLS],
     });
 
     if (completion.stop_reason === 'end_turn' ||
@@ -211,10 +216,36 @@ async function handleSubstrateMode({ user, message, res }) {
     }
 
     if (completion.stop_reason === 'tool_use') {
-      // Anthropic's server-side tools (web_search, web_fetch) execute on the
-      // platform and return results inside completion.content. Append the
-      // assistant turn and continue the loop.
+      // Append the assistant turn — it contains the tool_use blocks.
       messages.push({ role: 'assistant', content: completion.content });
+
+      // Execute each tool_use. Substrate tools run client-side here; any
+      // Anthropic server-side tools (web_search/web_fetch when re-added)
+      // resolve on Anthropic's platform and arrive with results already inline.
+      const toolUses = (completion.content || []).filter(b => b && b.type === 'tool_use');
+      const toolResults = [];
+      for (const toolUse of toolUses) {
+        let result;
+        if (toolUse.name && toolUse.name.startsWith('substrate_')) {
+          try {
+            result = await runSubstrateTool(toolUse.name, toolUse.input, toolContext);
+          } catch (err) {
+            result = { error: 'tool_exec_failed', detail: String(err.message || err) };
+          }
+        } else {
+          // Unknown client-side tool name — return an error so the model can recover.
+          result = { error: `unknown_client_tool: ${toolUse.name}` };
+        }
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: toolUse.id,
+          content: JSON.stringify(result),
+        });
+      }
+
+      if (toolResults.length > 0) {
+        messages.push({ role: 'user', content: toolResults });
+      }
       continue;
     }
 
@@ -239,7 +270,7 @@ async function handleSubstrateMode({ user, message, res }) {
   return res.status(200).json({ response: reply, reply, action: null });
 }
 
-// ─── Helpers ──────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────────────────────────────────────
 function extractText(completion) {
   return (completion.content || [])
     .filter(b => b.type === 'text')
