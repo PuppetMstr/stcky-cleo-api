@@ -22,13 +22,33 @@
 //   - Uses _lib/auth, _lib/objects, _lib/hybrid-search, _lib/system-prompt directly
 //   - No substrate.js indirection — same pattern as every other route handler
 
-const Anthropic = require('@anthropic-ai/sdk');
 const { getDb, auth, cors } = require('./_lib/auth');
 const { putObject } = require('./_lib/objects');
 const { searchHybrid } = require('./_lib/hybrid-search');
 const { buildSystemPrompt, STCKY_SURFACE } = require('./_lib/system-prompt');
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Raw Anthropic API access — no SDK. Matches cleo-api's lean-no-heavy-SDKs pattern.
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_VERSION = '2023-06-01';
+
+async function callAnthropic({ model, max_tokens, system, messages, tools }) {
+  const body = { model, max_tokens, system, messages };
+  if (tools && tools.length > 0) body.tools = tools;
+  const r = await fetch(ANTHROPIC_API_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': ANTHROPIC_VERSION,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`anthropic_api_${r.status}: ${text.slice(0, 500)}`);
+  }
+  return await r.json();
+}
 
 // ─── Tunables ─────────────────────────────────────────────────
 const MODEL                       = 'claude-sonnet-4-6';
@@ -110,7 +130,7 @@ async function handleStatelessMode({ message, history, res }) {
     { role: 'user', content: message },
   ];
 
-  const completion = await anthropic.messages.create({
+  const completion = await callAnthropic({
     model: MODEL,
     max_tokens: MAX_TOKENS,
     system: STATELESS_SYSTEM_PROMPT,
@@ -176,7 +196,7 @@ async function handleSubstrateMode({ user, message, res }) {
   let finalResponse = null;
 
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
-    const completion = await anthropic.messages.create({
+    const completion = await callAnthropic({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       system: systemPrompt,
