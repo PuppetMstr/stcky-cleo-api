@@ -15,7 +15,7 @@ const { getDb, auth, cors, ObjectId } = require('./_lib/auth');
 const { putObject } = require('./_lib/objects');
 
 module.exports = async (req, res) => {
-  cors(req, res);
+  cors(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
