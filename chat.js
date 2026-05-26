@@ -60,12 +60,12 @@ const CONTEXT_CHAR_BUDGET         = 16000;   // ~4K tokens, leaves headroom
 const MAX_TOOL_TURNS              = 8;       // safety cap on tool-use iteration
 const SUBSTRATE_TIERS             = new Set(['paid', 'founder']);
 
-// Built-in Anthropic tools enabled in paid mode.
-// NOTE: tool type identifiers are versioned — verify current strings at deploy time.
-const PAID_TOOLS = [
-  { type: 'web_search_20250305', name: 'web_search' },
-  { type: 'web_fetch_20250915',  name: 'web_fetch'  },
-];
+// Built-in Anthropic tools for substrate mode. Tool version identifiers roll
+// forward; current valid versions need verification from Anthropic docs.
+// SHIPPING EMPTY FOR NOW — proves substrate retrieval works end-to-end without
+// the version-pinning blocker. Add tools back in a follow-up once we look up
+// current valid type identifiers.
+const PAID_TOOLS = [];
 
 const STATELESS_SYSTEM_PROMPT =
   `You are a STCKY — a substrate-shaped conversational agent. ` +
