@@ -48,3 +48,8 @@ patch-v*.cjs
 peek-*.cjs
 *.bak-*
 
+
+# junk drawer - kept on disk, out of git's face
+archive/
+*.bak
+*.bak.*
