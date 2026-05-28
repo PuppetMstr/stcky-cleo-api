@@ -22,6 +22,13 @@ const OBJECTS_VECTOR_INDEX  = 'objects_vector_index';
 
 const EXACT_MATCH_SCORE = 1000;  // dominant; ensures exact slug hits sort first
 
+// SEMANTIC PATH = RELEVANCE ONLY. Recency/momentum is the temporal path's job
+// (the parallel recent-objects pull + /v1/read mode=now), not the semantic
+// ranker's. Mixing time windows into semantic search re-pollutes it with the
+// noise the temporal window suffers from. Default 0 = pure relevance.
+// Dial up (e.g. 0.25) to reintroduce a gentle recency nudge if ever wanted.
+const SEMANTIC_TEMPORAL_WEIGHT = 0;
+
 // --------------------------------------------------------------------------
 // Tokenization + escaping
 // --------------------------------------------------------------------------
@@ -298,7 +305,7 @@ function mergeAndRankMemories(vectorResults, keywordResults, queryTerms, now) {
     const temporalScore = calculateTemporalScore(m, now);
     const normalizedVector = (m.vectorScore || 0) * 50;
     const keywordPart = m.keywordScore || 0;
-    m.relevanceScore = Math.round(normalizedVector + keywordPart + temporalScore);
+    m.relevanceScore = Math.round(normalizedVector + keywordPart + SEMANTIC_TEMPORAL_WEIGHT * temporalScore);
   }
 
   merged.sort((a, b) => b.relevanceScore - a.relevanceScore);
@@ -342,7 +349,7 @@ function mergeAndRankObjects(vectorResults, keywordResults, queryTerms, now) {
     const temporalScore = calculateObjectTemporalScore(o, now);
     const normalizedVector = (o.vectorScore || 0) * 50;
     const keywordPart = o.keywordScore || 0;
-    o.relevanceScore = Math.round(normalizedVector + keywordPart + temporalScore);
+    o.relevanceScore = Math.round(normalizedVector + keywordPart + SEMANTIC_TEMPORAL_WEIGHT * temporalScore);
   }
 
   merged.sort((a, b) => b.relevanceScore - a.relevanceScore);
