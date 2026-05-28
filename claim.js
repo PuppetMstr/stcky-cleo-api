@@ -17,6 +17,8 @@
 // Uses _lib/auth's getDb() + cors() helpers to match cleo-api conventions.
 const crypto = require('crypto');
 const { getDb, cors } = require('./_lib/auth');
+const { findUserByReferralCode } = require('./_lib/referral');
+// REFERRAL_INTEGRATION_INJECTED
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const INGEST_BASE = process.env.CLEO_API_BASE || 'https://api.stcky.ai';
 function makeToken() {
@@ -46,6 +48,24 @@ module.exports = async function handler(req, res) {
   }
   if (!turns) {
     return res.status(400).json({ error: 'invalid_turns' });
+  }
+
+  // Optional referral capture. If body.referrer_token is provided and matches
+  // an existing user's referral_code, stamp referred_by on the new user record.
+  let referrerInfo = null;
+  if (typeof body.referrer_token === 'string' && body.referrer_token.trim()) {
+    try {
+      const referrer = await findUserByReferralCode(body.referrer_token);
+      if (referrer && referrer.email !== email) {
+        referrerInfo = {
+          referred_by: referrer._id,
+          referrer_email: referrer.email,
+        };
+      }
+    } catch (e) {
+      console.error('[claim] referral lookup error', e.message);
+      // graceful: continue without referral attribution
+    }
   }
   // Split `name` into firstName/lastName -- matches schema other code reads.
   // First token = firstName, remainder = lastName. Single-word names land
@@ -83,8 +103,36 @@ module.exports = async function handler(req, res) {
       claimed_from: 'stcky.ai_first_touch',
       claimed_at: now
     };
+    if (referrerInfo) {
+      userDoc.referred_by = referrerInfo.referred_by;
+      userDoc.referrer_email = referrerInfo.referrer_email;
+    }
     const result = await users.insertOne(userDoc);
     const userId = result.insertedId;
+
+    // Record this signup on the referrer's record (best-effort, non-blocking)
+    if (referrerInfo) {
+      try {
+        await users.updateOne(
+          { _id: referrerInfo.referred_by },
+          {
+            $push: {
+              referrals: {
+                user_email: email,
+                user_id: userId,
+                signup_date: now,
+                converted: false,
+                first_purchase: null,
+              }
+            },
+            $inc: { total_referrals: 1 },
+            $set: { updatedAt: now }
+          }
+        );
+      } catch (e) {
+        console.error('[claim] failed to record referral on referrer', e.message);
+      }
+    }
     // ingest pre-auth turns under the new user's apiKey (best-effort)
     const ingestUrl = INGEST_BASE + '/api/ingest';
     const ingested = [];
