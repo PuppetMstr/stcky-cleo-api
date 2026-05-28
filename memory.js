@@ -1,3 +1,21 @@
+// /api/memory -- STCKY memory CRUD + search + audit endpoint
+// ==========================================================
+//
+// PATCHED 2026-05-16 (Eli, v4):
+//   - action=search now returns trimmed previews (first 800 chars of value)
+//     for non-exact matches. Memories run 20-30 KB each in this substrate,
+//     and 5 full-body results pushed responses to 130-170 KB -- over
+//     Custom GPT Actions ~100 KB cap. Search returns previews; full bodies
+//     come from direct fetch (/api/memory?category=X&key=Y or
+//     /v1/read mode=category_key).
+//   - Exact-slug matches (matchType=exact_slug or exact_key) keep the full
+//     body. Caller pasted an identifier expecting that specific memory;
+//     give them the whole thing.
+//
+// PATCHED 2026-05-16 (Eli, v3):
+//   - action=search default limit 20 -> 5.
+//   - searchHybrid v3 adds exact-slug bypass for identifier-shaped queries.
+
 const { getDb, auth, cors, ObjectId } = require('./_lib/auth');
 const { embedMemory } = require('./_lib/embeddings');
 const {
@@ -7,13 +25,15 @@ const {
   changesSince,
   ensureIndexes,
 } = require('./_lib/events');
+const { searchHybrid, tokenize, escapeRegex } = require('./_lib/hybrid-search');
 
-// Run once per cold start — Mongo createIndex is idempotent, so safe to re-call.
+const SEARCH_PREVIEW_CHARS = 800;  // truncation length for non-exact search results
+
 let _indexesReady = null;
 async function ensureEventIndexes(db) {
   if (!_indexesReady) _indexesReady = ensureIndexes(db).catch((e) => {
     console.error('[events] ensureIndexes failed:', e.message);
-    _indexesReady = null; // retry next call
+    _indexesReady = null;
   });
   return _indexesReady;
 }
@@ -30,12 +50,34 @@ function getAction(url) {
   return 'crud';
 }
 
-// Derive source string when client doesn't provide one.
-// Matches v1.0 dotted convention: provider.interface.conversation_id
 function deriveSource(req, user, explicit) {
   if (explicit && typeof explicit === 'string' && explicit.includes('.')) return explicit;
   const tail = user && user._id ? String(user._id).slice(-6) : 'anon';
   return `api.rest.user_${tail}`;
+}
+
+// Trim a memory for search-result preview. Strips embedding + truncates
+// value. Exact-slug matches skip this (caller wants full body).
+function trimForPreview(m) {
+  const isExact = m.matchType === 'exact_slug' || m.matchType === 'exact_key';
+  const fullValue = m.value || '';
+  const truncated = !isExact && fullValue.length > SEARCH_PREVIEW_CHARS;
+  return {
+    _id: m._id,
+    category: m.category,
+    key: m.key,
+    value: truncated ? fullValue.slice(0, SEARCH_PREVIEW_CHARS) + '...' : fullValue,
+    tags: m.tags || '',
+    domain: m.domain || null,
+    relevantDate: m.relevantDate || null,
+    anchor: m.anchor === true,
+    createdAt: m.createdAt,
+    updatedAt: m.updatedAt,
+    relevanceScore: m.relevanceScore,
+    matchType: m.matchType || null,
+    truncated: truncated || undefined,
+    value_length: fullValue.length,
+  };
 }
 
 module.exports = async (req, res) => {
@@ -59,7 +101,7 @@ module.exports = async (req, res) => {
   );
 
   try {
-    // ============ HISTORY (new) ============
+    // ============ HISTORY ============
     if (action === 'history') {
       const { category, key } = req.method === 'POST' ? req.body : req.query;
       if (!category || !key) {
@@ -70,7 +112,7 @@ module.exports = async (req, res) => {
       return res.json({ entity_id, events, count: events.length });
     }
 
-    // ============ AS-OF (new, counterfactual) ============
+    // ============ AS-OF ============
     if (action === 'as-of') {
       const { category, key, timestamp } = req.method === 'POST' ? req.body : req.query;
       if (!category || !key || !timestamp) {
@@ -82,7 +124,7 @@ module.exports = async (req, res) => {
       return res.json({ entity_id, ...snapshot });
     }
 
-    // ============ CHANGES SINCE (new, delta) ============
+    // ============ CHANGES SINCE ============
     if (action === 'changes') {
       const { since, category, key, event_type, limit } = req.method === 'POST' ? req.body : req.query;
       if (!since) return res.status(400).json({ error: 'since timestamp required' });
@@ -121,39 +163,41 @@ module.exports = async (req, res) => {
     }
 
     // ============ SEARCH ============
+    // v4 (2026-05-16): preview-truncated value (800 chars) on non-exact
+    // matches. Exact-slug matches keep full body. Default limit 5.
     if (action === 'search') {
-      const { query, limit = '20', projectId } = req.query;
+      const { query, limit = '5', projectId } = req.query;
       if (!query) return res.status(400).json({ error: 'query parameter required' });
 
-      let baseQuery;
+      let scope;
       if (projectId) {
         const project = await db.collection('projects').findOne({
           _id: new ObjectId(projectId),
           $or: [{ ownerId: user._id }, { memberIds: user._id }]
         });
         if (!project) return res.status(403).json({ error: 'No access to this project' });
-        baseQuery = { projectId: new ObjectId(projectId) };
+        scope = { projectId: new ObjectId(projectId) };
       } else {
-        baseQuery = { userId: user._id };
+        scope = { userId: user._id };
       }
 
-      const searchQuery = {
-        ...baseQuery,
-        $or: [
-          { key: { $regex: query, $options: 'i' } },
-          { value: { $regex: query, $options: 'i' } },
-          { tags: { $regex: query, $options: 'i' } },
-          { category: { $regex: query, $options: 'i' } }
-        ]
-      };
+      const limitNum = Math.max(1, Math.min(parseInt(limit) || 5, 50));
 
-      const results = await db.collection('memories')
-        .find(searchQuery)
-        .sort({ updatedAt: -1 })
-        .limit(parseInt(limit))
-        .toArray();
+      const result = await searchHybrid(db, scope, query, {
+        limit: limitNum,
+        includeMemories: true,
+        includeObjects: false,
+        now: new Date(),
+      });
 
-      return res.json({ memories: results, count: results.length, projectId: projectId || null });
+      return res.json({
+        memories: result.memories.map(trimForPreview),
+        count: result.memories.length,
+        searchMethod: result.searchMethod,
+        exactMatchCount: result.exactMatchCount,
+        preview_chars: SEARCH_PREVIEW_CHARS,
+        projectId: projectId || null,
+      });
     }
 
     // ============ UPCOMING ============
@@ -193,15 +237,11 @@ module.exports = async (req, res) => {
       });
     }
 
-    // ============ RECENT (v4.18.0) ============
-    // Structural query for the recent-substrate wake-up slice.
-    // Mirrors the upcoming-action shape but on updatedAt with a backward window
-    // and an optional category-IN filter. No semantic search. Per
-    // vision/recent-substrate-as-primary-wake-up-surface-2026-05-06.
+    // ============ RECENT ============
     if (action === 'recent') {
       const { hours = '36', categories, limit = '50', projectId } = req.query;
 
-      const hoursNum = Math.max(1, Math.min(parseInt(hours) || 36, 168)); // cap at 7 days
+      const hoursNum = Math.max(1, Math.min(parseInt(hours) || 36, 168));
       const limitNum = Math.max(1, Math.min(parseInt(limit) || 50, 200));
       const cutoffDate = new Date(Date.now() - hoursNum * 60 * 60 * 1000);
       const nowDate = new Date();
@@ -304,13 +344,18 @@ module.exports = async (req, res) => {
 
       if (category) query.category = category;
       if (key) query.key = key;
+
       if (searchTerm) {
-        query.$or = [
-          { key: { $regex: searchTerm, $options: 'i' } },
-          { value: { $regex: searchTerm, $options: 'i' } },
-          { tags: { $regex: searchTerm, $options: 'i' } },
-          { category: { $regex: searchTerm, $options: 'i' } }
-        ];
+        const tokens = tokenize(searchTerm);
+        if (tokens.length > 0) {
+          const escapedTerms = tokens.map(escapeRegex);
+          query.$or = escapedTerms.flatMap(term => [
+            { key:      { $regex: term, $options: 'i' } },
+            { value:    { $regex: term, $options: 'i' } },
+            { tags:     { $regex: term, $options: 'i' } },
+            { category: { $regex: term, $options: 'i' } },
+          ]);
+        }
       }
 
       const memories = await db.collection('memories')
@@ -333,7 +378,6 @@ module.exports = async (req, res) => {
         projectId,
         domain,
         anchor,
-        // v1.0 event-aware fields (all optional, safe defaults applied):
         actor: actorIn,
         causation_id,
       } = req.body;
@@ -380,12 +424,8 @@ module.exports = async (req, res) => {
 
       const existing = await db.collection('memories').findOne(findQuery);
 
-      // Generate embedding
       const embeddingData = await embedMemory({ category, key, value, tags });
 
-      // --- Phase 0: append event BEFORE snapshot write ---
-      // The events collection is the audit trail. `memories` collection stays as-is
-      // (now playing the role of materialized snapshot).
       const entity_id = `memory:${category}:${key}`;
       const event_type = existing ? 'memory_updated' : 'memory_created';
       const actor = actorIn || 'user';
@@ -419,17 +459,14 @@ module.exports = async (req, res) => {
         relevantDate: relevantDate ? new Date(relevantDate) : null,
         domain: domain ? domain.toLowerCase() : null,
         anchor: anchor === true || anchor === 'true' || false,
-        // Embedding fields (v5.0)
         embedding: embeddingData?.embedding || null,
         embeddingModel: embeddingData?.model || null,
         embeddingDims: embeddingData?.dims || null,
-        // Timestamps
         createdAt: existing ? existing.createdAt : now,
         updatedAt: now,
         lastAccessedAt: now,
         accessCount: existing ? (existing.accessCount || 0) + 1 : 1,
         createdBy: user._id,
-        // Phase 0 additions — chain the snapshot back to the event log.
         last_event_id: event_id,
         first_event_id: existing ? (existing.first_event_id || event_id) : event_id,
         version_count: existing ? ((existing.version_count || 1) + 1) : 1,
@@ -493,8 +530,6 @@ module.exports = async (req, res) => {
         deleteQuery = { userId: user._id, category, key };
       }
 
-      // Phase 0 — log the deletion as a field_patch event before removing the doc.
-      // Preserves audit trail: you can always reconstruct what the memory used to be.
       try {
         const entity_id = `memory:${category}:${key}`;
         await appendEvent(db, {

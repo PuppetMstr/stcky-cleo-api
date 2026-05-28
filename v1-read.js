@@ -1,4 +1,4 @@
-// /v1/read — STCKY thin-wrapper read endpoint
+// /v1/read -- STCKY thin-wrapper read endpoint
 // =============================================
 // Stable-door read door. Public contract: path /v1/read, mode values,
 // response field names. Everything else is room (free to refactor).
@@ -7,9 +7,18 @@
 //   { "src": "/v1/read", "dest": "/v1-read.js" }
 //
 // Companion spec: design-note/v1-read-thin-wrapper-spec-2026-05-11
-// Filed by Eli May 11, 2026, then rewritten against memory.js patterns.
+//
+// PATCHED 2026-05-16 (Eli): mode=semantic uses shared _lib/hybrid-search
+// primitive. Closes finding/semantic-search-fails-on-slug-syntax-queries-
+// 2026-05-16. Composes with principle/fix-it-right-no-patches-forward-
+// thinking-2026-05-16.
+//
+// PATCHED 2026-05-16 v2 (Eli): searchHybrid now takes a scope object (e.g.
+// { userId } or { projectId }) instead of a user object. One-line caller
+// change here; primitive becomes reusable for project-scoped search too.
 
 const { getDb, auth, cors } = require('./_lib/auth');
+const { searchHybrid } = require('./_lib/hybrid-search');
 
 // ============ NOW ============
 function nowISO() {
@@ -26,7 +35,6 @@ function nowHuman() {
 }
 
 // ============ RESPONSE SHAPING ============
-// Strip embedding + heavy internals; return the documented response fields only.
 function trimMemory(m) {
   return {
     _id: m._id,
@@ -60,18 +68,13 @@ function trimObject(o) {
 }
 
 // ============ MODE: NOW ============
-// NOW-anchored corpus pull. Parallel fan-out across curated (memories)
-// and raw (objects), merged time-descending.
 async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWindowDays) {
-  // PATCHED 2026-05-13: movable-now bounded window
   const hoursNum = Math.max(1, Math.min(parseInt(hours) || 24, 168));
   const limitNum = Math.max(1, Math.min(parseInt(limit) || 30, 200));
   const maxDays = Math.max(1, Math.min(parseInt(maxWindowDays) || 90, 365));
 
-  // Upper bound (the "anchor NOW"): cursor (before) > explicit anchor > current NOW
   const upperBound = before ? new Date(before) : (anchor ? new Date(anchor) : new Date());
 
-  // Lower bound: upperBound - hoursNum, clamped to maxDays back from current NOW
   const earliestAllowed = new Date(Date.now() - maxDays * 24 * 60 * 60 * 1000);
   let lowerBound = new Date(upperBound.getTime() - hoursNum * 60 * 60 * 1000);
   let exhaustedWindow = false;
@@ -80,7 +83,6 @@ async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWin
     exhaustedWindow = true;
   }
 
-  // Strict less-than when paginating via cursor; inclusive otherwise
   const upperOp = before ? '$lt' : '$lte';
 
   const inc = {
@@ -110,13 +112,11 @@ async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWin
       : Promise.resolve([]),
   ]);
 
-  // Time-descending merge across both collections, capped at limit total
   const merged = [
     ...memoryDocs.map(m => ({ kind: 'memory', ts: m.updatedAt, doc: m })),
     ...objectDocs.map(o => ({ kind: 'object', ts: o.ingested_at, doc: o })),
   ].sort((a, b) => b.ts - a.ts).slice(0, limitNum);
 
-  // Cursor: timestamp of the oldest returned item, for the next page call
   const cursor = merged.length > 0 ? merged[merged.length - 1].ts.toISOString() : null;
 
   return {
@@ -129,9 +129,6 @@ async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWin
 }
 
 // ============ MODE: SEMANTIC ============
-// v1.0 implementation: regex match across key/value/tags/category, mirroring
-// memory.js search action. Future: wrap associative.js for true vector ranking.
-// The mode name is door (stays stable); the implementation is room.
 async function semantic(db, user, query, limit, include) {
   const limitNum = Math.max(1, Math.min(parseInt(limit) || 10, 50));
 
@@ -140,41 +137,21 @@ async function semantic(db, user, query, limit, include) {
     raw: include.raw !== false,
   };
 
-  const memoryDocs = inc.curated
-    ? await db.collection('memories')
-        .find({
-          userId: user._id,
-          $or: [
-            { key: { $regex: query, $options: 'i' } },
-            { value: { $regex: query, $options: 'i' } },
-            { tags: { $regex: query, $options: 'i' } },
-            { category: { $regex: query, $options: 'i' } },
-          ],
-        })
-        .sort({ updatedAt: -1 })
-        .limit(limitNum)
-        .toArray()
-    : [];
-
-  const objectDocs = inc.raw
-    ? await db.collection('objects')
-        .find({
-          userId: user._id,
-          content: { $regex: query, $options: 'i' },
-        })
-        .sort({ ingested_at: -1 })
-        .limit(Math.ceil(limitNum / 2))
-        .toArray()
-    : [];
+  const result = await searchHybrid(db, { userId: user._id }, query, {
+    limit: limitNum,
+    includeMemories: inc.curated,
+    includeObjects:  inc.raw,
+    now: new Date(),
+  });
 
   return {
-    memories: memoryDocs.map(trimMemory),
-    objects: objectDocs.map(trimObject),
+    memories: result.memories.map(trimMemory),
+    objects:  result.objects.map(trimObject),
+    searchMethod: result.searchMethod,
   };
 }
 
 // ============ MODE: CATEGORY_KEY ============
-// Direct lookup. Returns the exact memory if found, otherwise empty list.
 async function byCategoryKey(db, user, category, key) {
   const memory = await db.collection('memories').findOne({
     userId: user._id,
@@ -188,12 +165,9 @@ async function byCategoryKey(db, user, category, key) {
 }
 
 // ============ MODE: THREAD ============
-// All memories with the thread tag matching the given thread string.
-// Tags are stored as a single comma-separated string; match as substring.
 async function byThread(db, user, thread, limit) {
   const limitNum = Math.max(1, Math.min(parseInt(limit) || 50, 200));
 
-  // Escape regex metachars in thread name
   const escaped = thread.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const rx = new RegExp(`(^|,)\\s*${escaped}\\s*(,|$)`, 'i');
 
@@ -210,9 +184,7 @@ async function byThread(db, user, thread, limit) {
 }
 
 // ============ MODE: RAW_RECENT ============
-// Raw objects only, NOW-anchored. Skips curated entirely.
 async function rawRecent(db, user, hours, limit, include, anchor, before, maxWindowDays) {
-  // PATCHED 2026-05-13: movable-now bounded window
   const hoursNum = Math.max(1, Math.min(parseInt(hours) || 24, 168));
   const limitNum = Math.max(1, Math.min(parseInt(limit) || 30, 200));
   const maxDays = Math.max(1, Math.min(parseInt(maxWindowDays) || 90, 365));
@@ -267,7 +239,6 @@ module.exports = async (req, res) => {
 
   const db = await getDb();
 
-  // Update lastSeen (mirrors memory.js hygiene)
   await db.collection('users').updateOne(
     { _id: user._id },
     { $set: { lastSeen: new Date() } }
@@ -283,9 +254,9 @@ module.exports = async (req, res) => {
     hours = 24,
     limit,
     include = {},
-    anchor,            // PATCHED 2026-05-13
-    before,            // PATCHED 2026-05-13 — cursor for pagination
-    max_window_days,   // PATCHED 2026-05-13 — outer wall, default 90
+    anchor,
+    before,
+    max_window_days,
   } = body;
 
   try {
@@ -329,6 +300,9 @@ module.exports = async (req, res) => {
       total_objects: result.objects.length,
     };
     if (result.window) response.window = result.window;
+    if (result.cursor !== undefined) response.cursor = result.cursor;
+    if (result.exhausted_window !== undefined) response.exhausted_window = result.exhausted_window;
+    if (result.searchMethod) response.searchMethod = result.searchMethod;
 
     console.log(`[V1/READ] mode=${mode} memories=${result.memories.length} objects=${result.objects.length}`);
     return res.status(200).json(response);

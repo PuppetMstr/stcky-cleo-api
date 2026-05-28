@@ -10,13 +10,33 @@
  *   - Backward compatible: existing queries work unchanged, organism features
  *     activate when organism-category memories are present in results.
  *   - Built on Rung 4 foundation: correction resolver remains active, organism
- *     kinds flow through same candidate generation → resolver → ranking pipeline.
+ *     kinds flow through same candidate generation -> resolver -> ranking pipeline.
+ *
+ * v5.3.1 (2026-05-16, Eli):
+ *   - Hybrid-search primitives extracted to ./_lib/hybrid-search.js for reuse
+ *     by /v1/read mode=semantic. Helpers now imported instead of defined inline.
+ *
+ * v5.3.2 (2026-05-16, Eli):
+ *   - hybrid-search primitives now take scope object instead of raw userId.
+ *     Call sites here pass { userId: user._id } as scope. Enables project-
+ *     scoped search elsewhere (memory.js action=search).
  *
  * (v5.2.3 changelog preserved below...)
  */
 
 const { getDb, auth, cors, ObjectId } = require('./_lib/auth');
 const { embed } = require('./_lib/embeddings');
+const {
+  memoryVectorSearch,
+  memoryKeywordSearch,
+  objectsVectorSearch,
+  objectsKeywordSearch,
+  mergeAndRankMemories,
+  mergeAndRankObjects,
+  calculateKeywordScore,
+  calculateTemporalScore,
+  calculateObjectTemporalScore,
+} = require('./_lib/hybrid-search');
 
 // Rung 3 helpers (inert if RETRIEVAL_V3_MODE is 'off')
 const {
@@ -30,31 +50,24 @@ const { runShadowCompare } = require('./_lib/retrieval-shadow');
 // Rung 4 helpers (inert if RUNG_4_MODE is 'off')
 const { resolveCorrections, shadowDivergence } = require('./_lib/correction-resolver');
 
-const MEMORIES_VECTOR_INDEX = 'memory_vector_index';
-const OBJECTS_VECTOR_INDEX  = 'objects_vector_index';
-
 // --------------------------------------------------------------------------
 // ORGANISM BETA: Retrieval priority and redirect handlers
 // --------------------------------------------------------------------------
 
 /**
  * Apply retrieval priority boosts for organism first-class kinds.
- * Called before ranking to artificially boost anchor-priority candidates.
  */
 function applyRetrievalPriority(candidates, nowMs) {
   const boosted = candidates.map(c => {
     if (c.retrieval_priority === 'anchor' && c.kind === 'now_state') {
-      // Calculate artificial boost: most recent now_state gets highest boost,
-      // older now_states get progressively less boost but still significant.
       const ageMs = nowMs - new Date(c.ts_human).getTime();
       const ageDays = ageMs / (1000 * 60 * 60 * 24);
-      
-      // Boost formula: 100 for today's, 80 for yesterday's, 60 for older
+
       let boost = 100;
       if (ageDays > 1) boost = 80;
       if (ageDays > 2) boost = 60;
       if (ageDays > 7) boost = 40;
-      
+
       return {
         ...c,
         artificial_boost: boost,
@@ -63,36 +76,32 @@ function applyRetrievalPriority(candidates, nowMs) {
     }
     return c;
   });
-  
+
   return boosted;
 }
 
 /**
  * Handle points_to redirects for handoff kinds.
- * Fetch target memories and surface them inline instead of handoff shells.
  */
 async function handlePointsToRedirects(rankedResults, db, userId) {
   const redirected = [];
-  
+
   for (const result of rankedResults) {
     const candidate = result.candidate;
-    
+
     if (candidate.kind === 'handoff' && candidate.points_to) {
       try {
-        // Fetch the target memory by category/key
         const targetQuery = {
           userId: userId,
           category: candidate.points_to.category,
           key: candidate.points_to.key
         };
-        
+
         const targetDoc = await db.collection('memories').findOne(targetQuery);
-        
+
         if (targetDoc) {
-          // Convert target to canonical envelope
           const targetCanonical = memoryToCanonical(targetDoc);
           if (targetCanonical) {
-            // Surface target instead of handoff, but preserve handoff metadata
             redirected.push({
               ...result,
               candidate: {
@@ -107,8 +116,7 @@ async function handlePointsToRedirects(rankedResults, db, userId) {
             continue;
           }
         }
-        
-        // If target not found, surface handoff with warning
+
         redirected.push({
           ...result,
           candidate: {
@@ -116,169 +124,23 @@ async function handlePointsToRedirects(rankedResults, db, userId) {
             redirect_warning: `Target not found: ${candidate.points_to.category}/${candidate.points_to.key}`
           }
         });
-        
+
       } catch (error) {
         console.log('[ORGANISM] Handoff redirect failed:', error.message);
-        // Surface original handoff on redirect failure
         redirected.push(result);
       }
     } else {
-      // Non-handoff candidates pass through unchanged
       redirected.push(result);
     }
   }
-  
+
   return redirected;
 }
 
 // --------------------------------------------------------------------------
-// Temporal scoring (unchanged from v5.0.0/5.1.0 — used by LEGACY path only).
+// Search primitives (memory*Search, objects*Search, mergeAndRank*,
+// calculate*Score) now live in ./_lib/hybrid-search.js -- imported above.
 // --------------------------------------------------------------------------
-
-function calculateTemporalScore(memory, now) {
-  let score = 0;
-  const hoursSinceUpdate = (now - new Date(memory.updatedAt)) / (1000 * 60 * 60);
-  if (hoursSinceUpdate < 24) score += 30;
-  else if (hoursSinceUpdate < 168) score += 20;
-  else if (hoursSinceUpdate < 720) score += 10;
-
-  if (memory.relevantDate) {
-    const hoursToRelevant = Math.abs(now - new Date(memory.relevantDate)) / (1000 * 60 * 60);
-    if (hoursToRelevant < 24) score += 30;
-    else if (hoursToRelevant < 168) score += 20;
-    else if (hoursToRelevant < 720) score += 10;
-  }
-
-  if (memory.accessCount > 10) score += 10;
-  else if (memory.accessCount > 5) score += 5;
-
-  return score;
-}
-
-function calculateObjectTemporalScore(obj, now) {
-  let score = 0;
-  const anchorTime = obj.timestamp || obj.ingested_at || obj.server_ingest_timestamp;
-  if (anchorTime) {
-    const hoursSince = (now - new Date(anchorTime)) / (1000 * 60 * 60);
-    if (hoursSince < 24) score += 30;
-    else if (hoursSince < 168) score += 20;
-    else if (hoursSince < 720) score += 10;
-  }
-  return score;
-}
-
-// --------------------------------------------------------------------------
-// Memory search paths (unchanged).
-// --------------------------------------------------------------------------
-
-async function memoryVectorSearch(db, userId, queryEmbedding, limit) {
-  try {
-    const pipeline = [
-      {
-        $vectorSearch: {
-          index: MEMORIES_VECTOR_INDEX,
-          path: 'embedding',
-          queryVector: queryEmbedding,
-          numCandidates: limit * 20,
-          limit: limit * 2,
-          filter: { userId: userId }
-        }
-      },
-      {
-        $project: {
-          _id: 1,
-          category: 1, key: 1, value: 1, tags: 1,
-          domain: 1, anchor: 1, relevantDate: 1,
-          createdAt: 1, updatedAt: 1, accessCount: 1,
-          vectorScore: { $meta: 'vectorSearchScore' }
-        }
-      }
-    ];
-    return await db.collection('memories').aggregate(pipeline).toArray();
-  } catch (error) {
-    console.log('[ASSOCIATIVE] Memory vector search failed:', error.message);
-    return null;
-  }
-}
-
-async function memoryKeywordSearch(db, userId, queryTerms, limit) {
-  const searchConditions = queryTerms.map(term => ({
-    $or: [
-      { key:      { $regex: term, $options: 'i' } },
-      { value:    { $regex: term, $options: 'i' } },
-      { tags:     { $regex: term, $options: 'i' } },
-      { category: { $regex: term, $options: 'i' } }
-    ]
-  }));
-
-  const searchQuery = {
-    userId: userId,
-    ...(searchConditions.length > 0 ? { $or: searchConditions.map(c => c.$or).flat() } : {})
-  };
-
-  return await db.collection('memories')
-    .find(searchQuery)
-    .limit(limit * 3)
-    .toArray();
-}
-
-// --------------------------------------------------------------------------
-// Object search paths (unchanged).
-// --------------------------------------------------------------------------
-
-async function objectsVectorSearch(db, userId, queryEmbedding, limit) {
-  try {
-    const pipeline = [
-      {
-        $vectorSearch: {
-          index: OBJECTS_VECTOR_INDEX,
-          path: 'embedding',
-          queryVector: queryEmbedding,
-          numCandidates: limit * 20,
-          limit: limit * 2,
-          filter: { userId: userId }
-        }
-      },
-      {
-        $project: {
-          _id: 1,
-          object_id: 1, content: 1, content_length: 1,
-          source_type: 1, source: 1, speaker: 1,
-          session_id: 1, turn_index: 1, trace_id: 1, client: 1,
-          timestamp: 1, ingested_at: 1,
-          parent_object_id: 1, chunk_index: 1,
-          embedding: 1, // needed by adapter to determine enrichment.state
-          metadata: 1,
-          vectorScore: { $meta: 'vectorSearchScore' }
-        }
-      }
-    ];
-    return await db.collection('objects').aggregate(pipeline).toArray();
-  } catch (error) {
-    console.log('[ASSOCIATIVE] Objects vector search failed:', error.message);
-    return null;
-  }
-}
-
-async function objectsKeywordSearch(db, userId, queryTerms, limit) {
-  if (queryTerms.length === 0) return [];
-
-  const searchConditions = queryTerms.map(term => ({
-    $or: [
-      { content: { $regex: term, $options: 'i' } },
-      { source:  { $regex: term, $options: 'i' } },
-      { speaker: { $regex: term, $options: 'i' } }
-    ]
-  }));
-
-  return await db.collection('objects')
-    .find({
-      userId: userId,
-      $or: searchConditions.map(c => c.$or).flat()
-    })
-    .limit(limit * 3)
-    .toArray();
-}
 
 // --------------------------------------------------------------------------
 // Events search path (NEW in v5.2.0 for Rung 3).
@@ -301,7 +163,7 @@ async function eventsKeywordSearch(db, userId, queryTerms, limit) {
     return await db.collection('events')
       .find({
         userId: userId,
-        type: { $ne: 'retrieval_shadow_compared' }, // don't recurse into shadow logs
+        type: { $ne: 'retrieval_shadow_compared' },
         $or: searchConditions.map(c => c.$or).flat()
       })
       .limit(limit * 3)
@@ -313,115 +175,12 @@ async function eventsKeywordSearch(db, userId, queryTerms, limit) {
 }
 
 // --------------------------------------------------------------------------
-// Merge + rank (legacy paths, unchanged).
-// --------------------------------------------------------------------------
-
-function mergeAndRankMemories(vectorResults, keywordResults, queryTerms, now) {
-  const seen = new Set();
-  const merged = [];
-
-  if (vectorResults) {
-    for (const m of vectorResults) {
-      const id = m._id.toString();
-      if (!seen.has(id)) {
-        seen.add(id);
-        m.vectorScore = m.vectorScore || 0;
-        m.keywordScore = 0;
-        merged.push(m);
-      }
-    }
-  }
-
-  if (keywordResults) {
-    for (const m of keywordResults) {
-      const id = m._id.toString();
-      if (!seen.has(id)) {
-        seen.add(id);
-        m.vectorScore = 0;
-        m.keywordScore = calculateKeywordScore(m, queryTerms, ['key', 'value', 'tags', 'category']);
-        merged.push(m);
-      } else {
-        const existing = merged.find(x => x._id.toString() === id);
-        if (existing) {
-          existing.keywordScore = calculateKeywordScore(m, queryTerms, ['key', 'value', 'tags', 'category']);
-        }
-      }
-    }
-  }
-
-  for (const m of merged) {
-    const temporalScore = calculateTemporalScore(m, now);
-    const normalizedVector = (m.vectorScore || 0) * 50;
-    const keywordPart = m.keywordScore || 0;
-    m.relevanceScore = Math.round(normalizedVector + keywordPart + temporalScore);
-  }
-
-  merged.sort((a, b) => b.relevanceScore - a.relevanceScore);
-  return merged;
-}
-
-function mergeAndRankObjects(vectorResults, keywordResults, queryTerms, now) {
-  const seen = new Set();
-  const merged = [];
-
-  if (vectorResults) {
-    for (const o of vectorResults) {
-      const id = o._id.toString();
-      if (!seen.has(id)) {
-        seen.add(id);
-        o.vectorScore = o.vectorScore || 0;
-        o.keywordScore = 0;
-        merged.push(o);
-      }
-    }
-  }
-
-  if (keywordResults) {
-    for (const o of keywordResults) {
-      const id = o._id.toString();
-      if (!seen.has(id)) {
-        seen.add(id);
-        o.vectorScore = 0;
-        o.keywordScore = calculateKeywordScore(o, queryTerms, ['content', 'source', 'speaker']);
-        merged.push(o);
-      } else {
-        const existing = merged.find(x => x._id.toString() === id);
-        if (existing) {
-          existing.keywordScore = calculateKeywordScore(o, queryTerms, ['content', 'source', 'speaker']);
-        }
-      }
-    }
-  }
-
-  for (const o of merged) {
-    const temporalScore = calculateObjectTemporalScore(o, now);
-    const normalizedVector = (o.vectorScore || 0) * 50;
-    const keywordPart = o.keywordScore || 0;
-    o.relevanceScore = Math.round(normalizedVector + keywordPart + temporalScore);
-  }
-
-  merged.sort((a, b) => b.relevanceScore - a.relevanceScore);
-  return merged;
-}
-
-function calculateKeywordScore(doc, queryTerms, fields) {
-  if (!queryTerms || queryTerms.length === 0) return 0;
-  let score = 0;
-  const parts = fields.map(f => String(doc[f] ?? '')).join(' ').toLowerCase();
-  for (const term of queryTerms) {
-    if (parts.includes(term.toLowerCase())) {
-      score += 40 / queryTerms.length;
-    }
-  }
-  return Math.round(score);
-}
-
-// --------------------------------------------------------------------------
-// LEGACY pipeline — v5.1.0 logic extracted into a helper.
-// Returns the response object (no res.json() — caller does that).
+// LEGACY pipeline -- v5.1.0 logic extracted into a helper.
 // --------------------------------------------------------------------------
 
 async function runLegacyPipeline({ db, user, query, queryTerms, limit, now, includeMemories, includeObjects, projectId, previousLastSeen }) {
+  const scope = { userId: user._id };
+
   const [smallEmbed, largeEmbed] = await Promise.all([
     includeMemories ? embed(query, 'small') : Promise.resolve(null),
     includeObjects  ? embed(query, 'large') : Promise.resolve(null),
@@ -429,20 +188,20 @@ async function runLegacyPipeline({ db, user, query, queryTerms, limit, now, incl
 
   const memoryTasks = [];
   if (includeMemories) {
-    memoryTasks.push(smallEmbed?.embedding
-      ? memoryVectorSearch(db, user._id, smallEmbed.embedding, limit)
+    memoryTasks.push(smallEmbed && smallEmbed.embedding
+      ? memoryVectorSearch(db, scope, smallEmbed.embedding, limit)
       : Promise.resolve(null));
-    memoryTasks.push(memoryKeywordSearch(db, user._id, queryTerms, limit));
+    memoryTasks.push(memoryKeywordSearch(db, scope, queryTerms, limit));
   } else {
     memoryTasks.push(Promise.resolve(null), Promise.resolve([]));
   }
 
   const objectTasks = [];
   if (includeObjects) {
-    objectTasks.push(largeEmbed?.embedding
-      ? objectsVectorSearch(db, user._id, largeEmbed.embedding, limit)
+    objectTasks.push(largeEmbed && largeEmbed.embedding
+      ? objectsVectorSearch(db, scope, largeEmbed.embedding, limit)
       : Promise.resolve(null));
-    objectTasks.push(objectsKeywordSearch(db, user._id, queryTerms, limit));
+    objectTasks.push(objectsKeywordSearch(db, scope, queryTerms, limit));
   } else {
     objectTasks.push(Promise.resolve(null), Promise.resolve([]));
   }
@@ -478,18 +237,12 @@ async function runLegacyPipeline({ db, user, query, queryTerms, limit, now, incl
 }
 
 // --------------------------------------------------------------------------
-// V3 pipeline (Rung 3). Queries three collections, adapts to canonical
-// envelopes, ranks via shared ranker, returns additive response shape.
-// RUNG 4 (v5.2.3): correction resolver runs between candidate building and ranking.
-// ORGANISM BETA (v5.3.0): retrieval priority and handoff redirect applied after ranking.
+// V3 pipeline (Rung 3).
 // --------------------------------------------------------------------------
 
 async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeMemories, includeObjects, includeEvents, projectId, previousLastSeen, rung4 }) {
-  // Use the LARGE embedding for both memories and objects so a single vector
-  // can drive semantic scoring across sources. Legacy kept them split because
-  // the indexes use different dimensions; but for RANKING we want a single
-  // semantic axis. Memories index is 1536 (small), objects index is 3072
-  // (large) — so we actually need both embeddings, one per source's index.
+  const scope = { userId: user._id };
+
   const [smallEmbed, largeEmbed] = await Promise.all([
     includeMemories ? embed(query, 'small') : Promise.resolve(null),
     includeObjects  ? embed(query, 'large') : Promise.resolve(null),
@@ -497,20 +250,20 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
 
   const memoryTasks = [];
   if (includeMemories) {
-    memoryTasks.push(smallEmbed?.embedding
-      ? memoryVectorSearch(db, user._id, smallEmbed.embedding, limit)
+    memoryTasks.push(smallEmbed && smallEmbed.embedding
+      ? memoryVectorSearch(db, scope, smallEmbed.embedding, limit)
       : Promise.resolve(null));
-    memoryTasks.push(memoryKeywordSearch(db, user._id, queryTerms, limit));
+    memoryTasks.push(memoryKeywordSearch(db, scope, queryTerms, limit));
   } else {
     memoryTasks.push(Promise.resolve(null), Promise.resolve([]));
   }
 
   const objectTasks = [];
   if (includeObjects) {
-    objectTasks.push(largeEmbed?.embedding
-      ? objectsVectorSearch(db, user._id, largeEmbed.embedding, limit)
+    objectTasks.push(largeEmbed && largeEmbed.embedding
+      ? objectsVectorSearch(db, scope, largeEmbed.embedding, limit)
       : Promise.resolve(null));
-    objectTasks.push(objectsKeywordSearch(db, user._id, queryTerms, limit));
+    objectTasks.push(objectsKeywordSearch(db, scope, queryTerms, limit));
   } else {
     objectTasks.push(Promise.resolve(null), Promise.resolve([]));
   }
@@ -526,7 +279,6 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     ...memoryTasks, ...objectTasks, ...eventTasks,
   ]);
 
-  // --- Build canonical candidates + signal map ---
   const candidates = [];
   const signalsMap = new Map();
 
@@ -572,8 +324,7 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     signalsMap.set(c.event_id, { semantic: vec, lexical: kw / 40 });
   }
 
-  // Events (lexical only — adapter flags enrichment.state='skipped' so ranker
-  // will zero out semantic even if we passed a nonzero value)
+  // Events (lexical only)
   for (const e of (evtKw || [])) {
     const c = eventToCanonical(e);
     if (!c) continue;
@@ -583,28 +334,20 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
   }
 
   // --- RUNG 4: resolve corrections (gated by RUNG_4_MODE) ---
-  // Per design-note/rung-4-corrections-resolver-design-v0.2-2026-05-01.
-  // Resolver is purely additive at read time — original memories stay in
-  // cleo.memories untouched. Direct key lookup via memory_recall always
-  // returns the original; only associative_recall filters when rung4.active.
   let workingCandidates = candidates;
   let rung4DivergenceLog = null;
 
   if (rung4 && rung4.active) {
-    // Live: filter candidates through correction resolver
     workingCandidates = resolveCorrections(candidates);
   } else if (rung4 && rung4.shadow) {
-    // Shadow: compute filter but don't apply; log divergence
     const resolved = resolveCorrections(candidates);
     rung4DivergenceLog = shadowDivergence(candidates, resolved);
-    // workingCandidates stays as `candidates` — shadow doesn't apply filter.
   }
 
   // --- ORGANISM BETA: apply retrieval priority boosts ---
   const prioritizedCandidates = applyRetrievalPriority(workingCandidates, now.getTime());
 
-  // --- Rank (merged, for new candidates field) ---
-  // Uses prioritizedCandidates so organism retrieval priority flows through ranking.
+  // --- Rank (merged) ---
   const ranked = rankCandidates(prioritizedCandidates, signalsMap, {
     nowMs: now.getTime(),
     limit,
@@ -614,17 +357,6 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
   const redirectedRanked = await handlePointsToRedirects(ranked, db, user._id);
 
   // --- Rank per source (for legacy back-compat arrays) ---
-  // PATCH 2026-04-25: legacy arrays must preserve the "limit per source"
-  // contract from runLegacyPipeline. The previous shape filtered the merged
-  // `ranked` list (capped at `limit` total), which let memories squeeze
-  // objects out of the legacy arrays when they outscored objects in the
-  // unified ranker — caused V3_BLIND_SPOTS in shadow data 2026-04-25.
-  // Fix: rank each source separately for the legacy arrays. The new
-  // `candidates` field still uses the merged ranked list (intentional new
-  // semantic — best N regardless of source).
-  // RUNG 4 (v5.2.3): per-source filtering uses workingCandidates so resolver
-  // filtering applies consistently to legacy arrays as well.
-  // ORGANISM BETA (v5.3.0): per-source uses prioritizedCandidates for consistency.
   const memCandidates = prioritizedCandidates.filter(c => c.meta.source_collection === 'memories');
   const objCandidates = prioritizedCandidates.filter(c => c.meta.source_collection === 'objects');
   const evtCandidates = prioritizedCandidates.filter(c => c.meta.source_collection === 'events');
@@ -632,7 +364,6 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
   const objRanked = rankCandidates(objCandidates, signalsMap, { nowMs: now.getTime(), limit });
   const evtRanked = rankCandidates(evtCandidates, signalsMap, { nowMs: now.getTime(), limit });
 
-  // --- Build additive response ---
   const candidatesOut = redirectedRanked.map(r => ({
     event_id:          r.candidate.event_id,
     score:             Math.round(r.score * 1000) / 1000,
@@ -647,16 +378,12 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     trust:             r.candidate.trust,
     meta:              r.candidate.meta,
     breakdown:         r.breakdown,
-    // ORGANISM BETA: include organism-specific metadata if present
     artificial_boost:  r.candidate.artificial_boost || undefined,
     boost_reason:      r.candidate.boost_reason || undefined,
     redirected_from:   r.candidate.redirected_from || undefined,
     redirect_warning:  r.candidate.redirect_warning || undefined,
   }));
 
-  // Legacy arrays from per-source ranked lists. Same raw-doc shape as legacy
-  // pipeline so clients reading `memories`/`objects` keep their existing
-  // field shape unchanged.
   const legacyMemories = [];
   for (const r of memRanked) {
     const entry = memRawById.get(r.candidate.meta.legacy_id);
@@ -691,9 +418,6 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
     events:   (evtKw && evtKw.length > 0) ? 'keyword' : 'none',
   };
 
-  // RUNG 4 shadow log: fire-and-forget. Don't block response on write
-  // failures. Event surfaces in associative_recall as substrate-health
-  // signal per "everything in / everything out" principle.
   if (rung4DivergenceLog && rung4DivergenceLog.filtered_count > 0) {
     db.collection('events').insertOne({
       type: 'rung_4_shadow_divergence',
@@ -728,14 +452,7 @@ async function runV3Pipeline({ db, user, query, queryTerms, limit, now, includeM
       }
     },
     memoryIdsForAccessUpdate: legacyMemories.map(m => m._id),
-    ranked: redirectedRanked, // merged top-N with redirects applied
-    // PATCH 2026-04-25 v5.2.2: rankedForShadow concatenates per-source ranked lists
-    // (each capped at limit per source) so shadow comparison sees the same shape
-    // legacy returns from runLegacyPipeline (memories + objects two-array). Without
-    // this, flattenV3Ranking would receive only `ranked` (capped at limit total)
-    // and shadow would always show false-positive "blind spots" because the
-    // comparison is apples-to-oranges (5 v3 items vs 10 legacy items). The merged
-    // `ranked` is still returned for v3-aware consumers; this is purely additional.
+    ranked: redirectedRanked,
     rankedForShadow: [...memRanked, ...objRanked, ...evtRanked],
   };
 }
@@ -758,22 +475,6 @@ function resolveMode(user) {
   if (raw === 'shadow') return { mode: 'shadow', isCanary, reason: 'shadow' };
   return { mode: 'legacy', isCanary, reason: 'off' };
 }
-
-// --------------------------------------------------------------------------
-// RUNG 4 mode resolution. Reads RUNG_4_MODE env var (off / shadow / canary /
-// on), reuses CANARY_USER_IDS from Rung 3 for canary user matching.
-//
-// Returns { active, shadow, reason }:
-//   active=true  → resolver filters candidates for this user
-//   shadow=true  → resolver runs but doesn't filter; divergence logged
-//   both false   → resolver inert
-//
-// Modes:
-//   off    → { active: false, shadow: false }       (default)
-//   shadow → { active: false, shadow: true  }       (everyone gets shadow log)
-//   canary → if user in CANARY_USER_IDS: active     else: shadow
-//   on     → { active: true,  shadow: false }       (everyone)
-// --------------------------------------------------------------------------
 
 function resolveRung4Mode(user) {
   const raw = String(process.env.RUNG_4_MODE || 'off').toLowerCase();
@@ -803,7 +504,6 @@ module.exports = async (req, res) => {
 
   const db = await getDb();
 
-  // Track lastSeen — applies to all modes, runs exactly once per request.
   const previousLastSeen = user.lastSeen || null;
   await db.collection('users').updateOne(
     { _id: user._id },
@@ -817,7 +517,7 @@ module.exports = async (req, res) => {
     projectId = req.body.projectId;
     includeObjects  = req.body.includeObjects  !== false;
     includeMemories = req.body.includeMemories !== false;
-    includeEvents   = req.body.includeEvents   !== false; // v3 only; legacy ignores
+    includeEvents   = req.body.includeEvents   !== false;
   } else if (req.method === 'GET') {
     query = req.query.query;
     limit = parseInt(req.query.limit) || 10;
@@ -836,32 +536,28 @@ module.exports = async (req, res) => {
     const queryTerms = query.split(/\s+/).filter(t => t.length > 2);
 
     const { mode, isCanary, reason } = resolveMode(user);
-    const rung4 = resolveRung4Mode(user); // { active, shadow, reason }
+    const rung4 = resolveRung4Mode(user);
 
     const commonArgs = {
       db, user, query, queryTerms, limit, now,
       includeMemories, includeObjects, includeEvents,
       projectId, previousLastSeen,
-      rung4, // RUNG 4: { active, shadow, reason }
+      rung4,
     };
 
-    // -------- LEGACY (mode=off) --------
     if (mode === 'legacy') {
       const { response, memoryIdsForAccessUpdate } = await runLegacyPipeline(commonArgs);
       await bumpAccessCounts(db, memoryIdsForAccessUpdate, now);
       return res.status(200).json(response);
     }
 
-    // -------- V3 (mode=on or canary-matched user) --------
     if (mode === 'v3') {
       const { response, memoryIdsForAccessUpdate } = await runV3Pipeline(commonArgs);
       await bumpAccessCounts(db, memoryIdsForAccessUpdate, now);
       return res.status(200).json(response);
     }
 
-    // -------- SHADOW (mode=shadow, or mode=canary for non-canary users) --------
     if (mode === 'shadow') {
-      // Build a scoped event logger that writes to cleo.events with userId.
       const eventLogger = async (evt) => {
         try {
           await db.collection('events').insertOne({
@@ -873,7 +569,6 @@ module.exports = async (req, res) => {
         }
       };
 
-      // Cache the legacy result so we can both return it and bump access counts.
       let capturedLegacy = null;
 
       const legacyResp = await runShadowCompare({
@@ -883,9 +578,6 @@ module.exports = async (req, res) => {
         },
         v3Fn: async () => {
           const v3 = await runV3Pipeline(commonArgs);
-          // PATCH 2026-04-25 v5.2.2: pass rankedForShadow (per-source merged) to
-          // keep comparison fair vs legacy's two-array shape. v3.ranked is the
-          // merged top-N capped at limit total — apples-to-oranges for shadow.
           return { ranked: v3.rankedForShadow, raw: v3.response };
         },
         logEvent: eventLogger,
@@ -907,7 +599,6 @@ module.exports = async (req, res) => {
       return res.status(200).json(legacyResp);
     }
 
-    // Should never reach here
     return res.status(500).json({ error: 'Unknown retrieval mode', mode });
 
   } catch (err) {
@@ -916,9 +607,6 @@ module.exports = async (req, res) => {
   }
 };
 
-// Access-count bump — preserved from legacy. Runs once per request, only on
-// the memories that the user actually received. Shadow mode does NOT
-// double-count (only the returned-to-user path bumps).
 async function bumpAccessCounts(db, memoryIds, now) {
   if (!memoryIds || memoryIds.length === 0) return;
   try {
