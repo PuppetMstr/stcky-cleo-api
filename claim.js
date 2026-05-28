@@ -107,6 +107,18 @@ module.exports = async function handler(req, res) {
       userDoc.referred_by = referrerInfo.referred_by;
       userDoc.referrer_email = referrerInfo.referrer_email;
     }
+
+    // Campaign attribution (first-touch source), injected by referral-client.js.
+    if (body.attribution && typeof body.attribution === 'object') {
+      userDoc.attribution = body.attribution;
+      userDoc.signup_source = body.attribution.utm_source || null;
+      userDoc.signup_campaign = body.attribution.utm_campaign || null;
+    }
+    // Real browser timezone (closes the LA-default TODO above).
+    if (typeof body.timezone === 'string' && body.timezone.trim()) {
+      userDoc.timezone = body.timezone.trim();
+    }
+
     const result = await users.insertOne(userDoc);
     const userId = result.insertedId;
 
