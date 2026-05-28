@@ -125,6 +125,13 @@ function substrateBlock(substratePull) {
 ${substratePull}`;
 }
 
+function temporalBlock(now) {
+  if (!now) return '';
+  return `Current moment:
+
+Right now it is ${now} (the user's local time). This is your temporal anchor - the "now" the operating discipline refers to. Reason about recency, elapsed time, and timestamps relative to this clock. You know the time; you do not know the user's day. Never narrate their life back to them as events you cannot see (do not infer they were "up all night" from a timestamp). State the time only if it is relevant; never guess it.`;
+}
+
 /**
  * Assemble the full STCKY system prompt.
  *
@@ -135,9 +142,10 @@ ${substratePull}`;
  * @param {string} args.substratePull - serialized recent substrate, ready to drop in
  * @returns {string} the assembled system prompt
  */
-function buildSystemPrompt({ personaName, userFirstName, surface, substratePull }) {
+function buildSystemPrompt({ personaName, userFirstName, surface, substratePull, now }) {
   return [
     UNIVERSAL_WHAT_STCKY_IS,
+    temporalBlock(now),
     UNIVERSAL_OPERATING_DISCIPLINE,
     UNIVERSAL_FEDERATION_AWARENESS,
     capabilityBlock(surface),

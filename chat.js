@@ -187,11 +187,21 @@ async function handleSubstrateMode({ user, message, res }) {
     (user.name ? String(user.name).split(/\s+/)[0] : '') ||
     '';
 
+  // Temporal anchor - the persona's "now". Mirrors the read door's now_human
+  // so the mouth speaks the same clock the substrate reads from.
+  const userTz = user.timezone || 'America/Los_Angeles';
+  const nowHuman = new Intl.DateTimeFormat('en-US', {
+    timeZone: userTz,
+    weekday: 'short', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(new Date());
+
   const systemPrompt = buildSystemPrompt({
     personaName,
     userFirstName,
     substratePull,
     surface: STCKY_SURFACE,
+    now: nowHuman,
   });
 
   // 4. Tool-use loop — keep calling until model says it's done
