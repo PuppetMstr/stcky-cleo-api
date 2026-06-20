@@ -31,7 +31,7 @@ module.exports = async function handler(req, res) {
   if (action === 'signup') {
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
     
-    const { email, password, profile } = req.body;
+    const { email, password, profile, timezone } = req.body;
     
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
@@ -62,6 +62,7 @@ module.exports = async function handler(req, res) {
         apiKey,
         firstName: (profile && typeof profile === 'object' && profile.firstName) || '',
         lastName:  (profile && typeof profile === 'object' && profile.lastName)  || '',
+        timezone: (typeof timezone === 'string' && timezone) || null,
         plan: 'free',
         memoryCount: 0,
         memoryLimit: 100,
@@ -287,6 +288,7 @@ module.exports = async function handler(req, res) {
             password: form.password.value,
             firstName: form.firstName?.value || '',
             lastName: form.lastName?.value || '',
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             client_id: form.client_id.value,
             redirect_uri: form.redirect_uri.value,
             state: form.state.value
@@ -318,7 +320,7 @@ module.exports = async function handler(req, res) {
   }
   
   if (req.method === 'POST') {
-    const { mode, email, password, firstName, lastName, client_id, redirect_uri, state } = req.body;
+    const { mode, email, password, firstName, lastName, timezone, client_id, redirect_uri, state } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     
     try {
@@ -337,6 +339,7 @@ module.exports = async function handler(req, res) {
           apiKey: apiKey,
           firstName: firstName || '',
           lastName: lastName || '',
+          timezone: (typeof timezone === 'string' && timezone) || null,
           plan: 'free',
           memoryLimit: 100,
           createdAt: new Date(),

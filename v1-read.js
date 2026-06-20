@@ -24,14 +24,18 @@ const { searchHybrid } = require('./_lib/hybrid-search');
 function nowISO() {
   return new Date().toISOString();
 }
-function nowHuman() {
+function nowHuman(user) {
+  // Each user's clock is their own: read the timezone captured at signup.
+  // Fall back to UTC (honestly labeled) only when we genuinely don't know -
+  // never silently default everyone to one zone.
+  const tz = (user && typeof user.timezone === 'string' && user.timezone) || 'UTC';
   const opts = {
-    timeZone: 'America/Los_Angeles',
+    timeZone: tz,
     month: 'short', day: 'numeric',
     hour: 'numeric', minute: '2-digit',
     hour12: true,
   };
-  return `${new Date().toLocaleString('en-US', opts)} (America/Los_Angeles)`;
+  return `${new Date().toLocaleString('en-US', opts)} (${tz})`;
 }
 
 // ============ RESPONSE SHAPING ============
@@ -292,7 +296,7 @@ module.exports = async (req, res) => {
 
     const response = {
       now_iso: nowISO(),
-      now_human: nowHuman(),
+      now_human: nowHuman(user),
       mode,
       memories: result.memories,
       objects: result.objects,

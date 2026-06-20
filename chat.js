@@ -81,7 +81,7 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    const { message, history } = parseBody(req.body);
+    const { message, history, clientTimeZone } = parseBody(req.body);
     if (!message) {
       return res.status(400).json({ error: 'message_required' });
     }
@@ -90,7 +90,7 @@ module.exports = async (req, res) => {
     const tier = user ? (user.tier || 'basic') : 'anonymous';
 
     if (user && SUBSTRATE_TIERS.has(tier)) {
-      return await handleSubstrateMode({ user, message, res });
+      return await handleSubstrateMode({ user, message, clientTimeZone, res });
     }
     return await handleStatelessMode({ message, history, res });
   } catch (err) {
@@ -102,12 +102,16 @@ module.exports = async (req, res) => {
 // ─── Body parsing — supports both contracts ─────────────────────────────
 function parseBody(body) {
   body = body || {};
+  const clientTimeZone =
+    typeof body.clientTimeZone === 'string' && body.clientTimeZone
+      ? body.clientTimeZone
+      : null;
   // Frontend contract: turns array
   if (Array.isArray(body.turns)) {
     const turns = body.turns;
     // Last user turn is the message
     const lastUser = [...turns].reverse().find(t => t && t.role === 'user');
-    if (!lastUser) return { message: null, history: [] };
+    if (!lastUser) return { message: null, history: [], clientTimeZone };
     const history = turns
       .slice(0, turns.lastIndexOf(lastUser))
       .filter(t => t && t.role && t.text)
@@ -115,12 +119,12 @@ function parseBody(body) {
         role: t.role === 'sticky' ? 'assistant' : t.role,
         content: t.text,
       }));
-    return { message: lastUser.text, history };
+    return { message: lastUser.text, history, clientTimeZone };
   }
   // API contract: message + history
   const message = typeof body.message === 'string' ? body.message : null;
   const history = Array.isArray(body.history) ? body.history : [];
-  return { message, history };
+  return { message, history, clientTimeZone };
 }
 
 // ─── Stateless mode (anonymous, basic, free) ────────────────────────────
@@ -146,7 +150,7 @@ async function handleStatelessMode({ message, history, res }) {
 // Full loop: ingest user → parallel recency+associative pull → assemble system
 // prompt → call with tools (loop on tool_use, executing substrate tools
 // client-side and feeding results back) → ingest assistant.
-async function handleSubstrateMode({ user, message, res }) {
+async function handleSubstrateMode({ user, message, clientTimeZone, res }) {
   const db = await getDb();
 
   // 1. Ingest user turn first (persists even if downstream fails)
@@ -189,7 +193,23 @@ async function handleSubstrateMode({ user, message, res }) {
 
   // Temporal anchor - the persona's "now". Mirrors the read door's now_human
   // so the mouth speaks the same clock the substrate reads from.
-  const userTz = user.timezone || 'America/Los_Angeles';
+  // Prefer the live browser timezone sent with this request; fall back to the
+  // stored value, then to a default. The browser's zone is the user's actual
+  // reality - handles travel, never-set, and stale stored values.
+  const userTz = clientTimeZone || user.timezone || 'UTC';
+
+  // Self-heal the stored timezone from the live browser so the wake read and
+  // future turns stay anchored to the same clock the user is actually on.
+  if (clientTimeZone && clientTimeZone !== user.timezone) {
+    try {
+      await db.collection('users').updateOne(
+        { _id: user._id },
+        { $set: { timezone: clientTimeZone } }
+      );
+    } catch (e) {
+      console.error('[chat] timezone heal failed:', e.message);
+    }
+  }
   const nowHuman = new Intl.DateTimeFormat('en-US', {
     timeZone: userTz,
     weekday: 'short', month: 'short', day: 'numeric',
