@@ -18,7 +18,10 @@
 // SMOKE TESTS RUN
 // - api: trivially ok if we got this far
 // - database: getDb() succeeded
-// - capture: latest tool_event in objects collection, age vs NOW
+// - capture: latest CONVERSATION object in objects collection, age vs NOW
+//   (was tool_event — retired June 10 2026 with the stcky-capture-chrome extension.
+//    Auto-ingest is now native server-side; the real pipe is conversation turns
+//    landing in the substrate, so we measure THAT instead of the dead tool_event stream.)
 // - recall: smoke probe via direct memory query (last memory write age)
 // - correction_resolver: process.env.RUNG_4_MODE
 // - organism_beta: presence of any kind=now_state memory
@@ -31,10 +34,14 @@
 const { getDb, ObjectId } = require('./_lib/auth');
 const { appendEvent, ensureIndexes } = require('./_lib/events');
 
-const CAPTURE_FRESHNESS_THRESHOLD_MIN = 60;     // tool_event within 60 min = ok
-const CAPTURE_DEGRADED_THRESHOLD_MIN = 240;     // 60–240 min = degraded
-                                                // > 240 min = unknown/stale
-const RECALL_FRESHNESS_THRESHOLD_MIN = 60 * 24; // any memory write in last 24h = ok
+// Capture now measures the REAL pipe: conversation objects landing in the substrate
+// (server-side ingest OR the manual loop) — not the retired stcky-capture-chrome
+// extension's tool_events. Thresholds are deliberately generous so that normal quiet
+// periods (overnight, stepping away) do NOT read as a capture failure. Tune to your
+// own "this long with nothing landed = something is actually wrong" line.
+const CAPTURE_FRESHNESS_THRESHOLD_MIN = 60 * 36;   // conversation within 36h = ok
+const CAPTURE_DEGRADED_THRESHOLD_MIN = 60 * 72;    // 36–72h = degraded; > 72h = unknown/stale
+const RECALL_FRESHNESS_THRESHOLD_MIN = 60 * 24;    // any memory write in last 24h = ok
 
 // Run once per cold start
 let _indexesReady = null;
@@ -102,19 +109,24 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: 'Database unavailable', message: err.message });
   }
 
-  // CHECK 1: Capture liveness — most recent tool_event for this user
+  // CHECK 1: Capture liveness — most recent CONVERSATION object for this user.
+  // (Was source_type: 'tool_event', written by the now-retired stcky-capture-chrome
+  // extension. That stream went dark May 14 2026, which made capture report
+  // "unknown/degraded" forever even while conversations kept landing. The real pipe
+  // is conversation turns hitting the substrate via server-side ingest or the manual
+  // loop, so we measure the freshness of those.)
   let captureStatus = 'unknown';
   let captureLastSeen = null;
   let captureAgeMin = null;
   try {
-    const latestToolEvent = await db.collection('objects')
+    const latestConversation = await db.collection('objects')
       .findOne(
-        { userId, source_type: 'tool_event' },
+        { userId, source_type: 'conversation' },
         { sort: { ingested_at: -1 }, projection: { ingested_at: 1, source: 1 } }
       );
-    if (latestToolEvent) {
-      captureLastSeen = latestToolEvent.ingested_at;
-      captureAgeMin = Math.floor((generatedAt - latestToolEvent.ingested_at) / (1000 * 60));
+    if (latestConversation) {
+      captureLastSeen = latestConversation.ingested_at;
+      captureAgeMin = Math.floor((generatedAt - latestConversation.ingested_at) / (1000 * 60));
       captureStatus = ageStatus(
         captureAgeMin,
         CAPTURE_FRESHNESS_THRESHOLD_MIN,
@@ -191,6 +203,7 @@ module.exports = async (req, res) => {
       },
       capture: {
         status: captureStatus,
+        source: 'conversation',   // real pipe (server-side ingest + manual loop); was 'tool_event'
         last_seen_at: captureLastSeen ? captureLastSeen.toISOString() : null,
         age_minutes: captureAgeMin,
         freshness_threshold_min: CAPTURE_FRESHNESS_THRESHOLD_MIN,
