@@ -95,7 +95,7 @@ module.exports = async function handler(req, res) {
       plan: 'free',
       tier: 'user',
       memoryLimit: 100,
-      timezone: 'America/Los_Angeles',     // TODO: derive from request headers later
+      timezone: null,                      // set from real browser tz (body.timezone) below; honest UTC at read-time if absent
       createdAt: now,                      // <-- renamed from `created_at`
       updatedAt: now,
       lastSeen: now,
