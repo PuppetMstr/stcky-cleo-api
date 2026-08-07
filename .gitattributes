@@ -1,0 +1,27 @@
+# .gitattributes -- written Aug 7 2026, Eli.
+#
+# WHY: the first real commit of this repo (0c75bc0, four months of production
+# work) threw ~32 "LF will be replaced by CRLF the next time Git touches it"
+# warnings. Nothing was wrong -- Windows checkouts get CRLF by default, so a
+# later checkout or pull could rewrite every one of those files and show them
+# as modified when not one character of logic had changed. A diff that lies
+# about what changed is the same disease as a count that lies about what it
+# read, in a smaller costume.
+#
+# This normalises every text file to LF in the repository AND in the working
+# copy. Vercel deploys the working copy, and CRLF vs LF is meaningless to Node,
+# so this changes nothing that runs. It only makes `git status` honest.
+#
+# .cmd is deliberately excepted: Windows batch files are safer with CRLF.
+
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.ico binary

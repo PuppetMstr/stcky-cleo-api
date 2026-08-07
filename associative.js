@@ -159,6 +159,37 @@ async function handlePointsToRedirects(rankedResults, db, userId) {
 // --------------------------------------------------------------------------
 
 // --------------------------------------------------------------------------
+// MEMORIES RECALL IS NOW OPT-IN TOO (Aug 7 2026, Eli). Same shape as the
+// events change three lines above it, and six times the cost.
+//
+// MEASURED, Atlas Query Insights, 24h ending 2026-08-07 ~11:18Z:
+//   cleo.memories $vectorSearch -- 4,570 executions, avg 9.37 s,
+//   11.89 HOURS of cluster execution time in a 24-hour day.
+//
+// COUNTED, Atlas Data Explorer, same morning:
+//   cleo.memories holds TEN DOCUMENTS. Ten. Its vector index is 11.34 kB.
+//   The newest is from April. They are: "Cleo is alive and Steven is the
+//   founder!" (Mar 11), "Jim is connected", a civil complaint belonging to a
+//   different userId, a form-fill profile, and six more of the same vintage.
+//   Fourteen indexes stand on those ten rows.
+//
+// The card file was ABOLISHED ON JUL 18 2026 -- every marker was poured into
+// the raw pool as a [RETIRED MARKER] object and nothing has been written to
+// this collection since. So every associative call has been paying for an
+// embedding round trip AND a vector search against ten dead rows, on the same
+// default that let the events scan run.
+//
+// AND THE CLUSTER CANNOT AFFORD IT. objects and memories vector searches sum
+// to 49.4 hours of execution a day. An M20 has 2 vCPU -- 48 CPU-hours in a
+// day. Vector search alone was asking for more than the box has, which is why
+// a limit=1 associative call took 8.6 s, why the ops board took 40 s, and why
+// Jul 26 fired a CPU alert that auto-scaling could not answer because M20 is
+// the configured ceiling. HALF OF THAT LOAD IS THE TEN ROWS.
+//
+// Opt back in any time with includeMemories=true. It is a parameter, not a
+// deletion, and the collection is untouched.
+// --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 // Events search path (NEW in v5.2.0 for Rung 3).
 // Events are the Phase 0 audit log. They are NOT semantically embedded
 // (adapter flags them enrichment.state='skipped'). Lexical only.
@@ -780,7 +811,7 @@ module.exports = async (req, res) => {
     depthParam = parseInt(req.body.depth, 10) || null;
     modeParam = req.body.mode || null;
     includeObjects  = req.body.includeObjects  !== false;
-    includeMemories = req.body.includeMemories !== false;
+    includeMemories = req.body.includeMemories === true;   // OPT-IN. See MEMORIES RECALL note below.
     includeEvents   = req.body.includeEvents   === true;   // OPT-IN. See EVENTS RECALL note below.
   } else if (req.method === 'GET') {
     query = req.query.query;
@@ -791,7 +822,7 @@ module.exports = async (req, res) => {
     depthParam = parseInt(req.query.depth, 10) || null;
     modeParam = req.query.mode || null;
     includeObjects  = req.query.includeObjects  !== 'false';
-    includeMemories = req.query.includeMemories !== 'false';
+    includeMemories = req.query.includeMemories === 'true';  // OPT-IN. See MEMORIES RECALL note below.
     includeEvents   = req.query.includeEvents   === 'true';  // OPT-IN. See EVENTS RECALL note below.
   } else {
     return res.status(405).json({ error: 'Method not allowed' });

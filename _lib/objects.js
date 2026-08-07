@@ -419,6 +419,27 @@ async function ensureObjectIndexes(db) {
   await db.collection('objects').createIndex({ userId: 1, parent_object_id: 1, chunk_index: 1 });
   await db.collection('objects').createIndex({ userId: 1, retry_pending: 1 });
 
+  // THE INDEX THAT ENDS THE QUOTA SCAN. Aug 7 2026, Eli.
+  //
+  // ingest.js counts parent objects against memoryLimit on EVERY WRITE, with
+  // { userId, is_parent: { $ne: false } }. There was no index on is_parent, so
+  // that count opened every document the user owns -- 41,547 of them at 41.9 kB
+  // apiece -- before a single new object could be stored.
+  //
+  // MEASURED, Atlas Query Insights, 24h ending 2026-08-07 11:18Z:
+  //   1,100 executions/day, avg 14.39 SECONDS each, 41,547.62 examined per
+  //   returned value, 4.40 HOURS of execution time in a 24-hour day.
+  // Third most expensive query shape on the cluster, and it ran on the ONE door
+  // that must never be slow: the door in.
+  //
+  // With userId first and is_parent second, the count is answered from index
+  // keys. A $ne cannot SEEK, but it can be satisfied by scanning the is_parent
+  // range inside one userId -- tiny keys instead of 1.7 GB of documents.
+  await db.collection('objects').createIndex(
+    { userId: 1, is_parent: 1 },
+    { name: 'userId_is_parent' }
+  );
+
   // THE INDEX THAT ENDS THE COLLECTION SCAN. Jul 28 2026.
   // userId first (every query is user-scoped), then head (the prefix range),
   // then ingested_at so the time window is satisfied inside the same index

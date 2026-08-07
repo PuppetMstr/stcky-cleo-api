@@ -81,11 +81,24 @@ module.exports = async (req, res) => {
 
     // Quota check — count parent objects (not children) against memoryLimit,
     // matching the 1-turn-1-object intent from Chaos Q2.
+    //
+    // CAPPED Aug 7 2026, Eli. This count runs on EVERY WRITE. Uncapped and
+    // unindexed it was reading 41,547 documents per ingest, 14.39 s average,
+    // 4.40 hours of cluster execution time a day -- on the one door that must
+    // never be slow. An index on { userId, is_parent } now answers it from
+    // keys (see ensureObjectIndexes), and the { limit } option stops the count
+    // the moment it reaches the quota.
+    //
+    // THE COMPARISON BELOW IS UNCHANGED. We only ever ask "is the count at or
+    // past the limit", so counting past the limit was always wasted work. A
+    // capped count answers that identically. The exact figure is still
+    // reported in the 403 body -- recomputed uncapped there, where it is rare
+    // and where the caller genuinely needs the true number.
+    const limit = user.memoryLimit || 100;
     const parentCount = await db.collection('objects').countDocuments({
       userId: user._id,
       is_parent: { $ne: false }, // parents OR single-object (non-chunked) stores
-    });
-    const limit = user.memoryLimit || 100;
+    }, { limit });
     // Allow the dedup path through even at quota — re-ingesting the same content
     // should be a cheap idempotent return, not a 403.
     // We'll only enforce the limit on NEW inserts, which putObject handles by
@@ -99,11 +112,17 @@ module.exports = async (req, res) => {
       const hash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
       const existing = await db.collection('objects').findOne({ userId: user._id, content_hash: hash });
       if (!existing) {
+        // Rare path. The capped count above says "at or past limit"; the caller
+        // being refused deserves the real number, so pay for it here only.
+        const trueCount = await db.collection('objects').countDocuments({
+          userId: user._id,
+          is_parent: { $ne: false },
+        });
         return res.status(403).json({
           error: 'Object quota reached',
           code: 'QUOTA_REACHED',
           limit,
-          current: parentCount,
+          current: trueCount,
           upgrade: 'Upgrade to Pro for more storage',
           upgradeUrl: 'https://stcky.ai/pricing.html',
         });

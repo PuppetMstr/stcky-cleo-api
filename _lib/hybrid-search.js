@@ -204,8 +204,12 @@ async function memoryKeywordSearch(db, scope, queryTerms, limit) {
     { category: { $regex: term, $options: 'i' } },
   ]);
 
+  // Deterministic for the same reason objectsKeywordSearch is -- see the note
+  // there. Memories order by updatedAt, which is the field their own ranker
+  // scores recency on.
   return await db.collection('memories')
     .find({ ...scope, $or: conditions })
+    .sort({ updatedAt: -1 })
     .limit(limit * 3)
     .toArray();
 }
@@ -258,8 +262,34 @@ async function objectsKeywordSearch(db, scope, queryTerms, limit) {
     { speaker: { $regex: term, $options: 'i' } },
   ]);
 
+  // A LIMIT WITHOUT A SORT IS AN ARBITRARY SLICE. Fixed Aug 7 2026, Eli.
+  //
+  // This was .find(...).limit(limit * 3) with no .sort(). Which matching
+  // documents came back was whatever the chosen query plan happened to yield
+  // first -- and NOTHING TOLD THE CALLER. It only ever LOOKED recency-ordered
+  // because the plan the optimiser picked happened to walk that way.
+  //
+  // WHAT IT COST, Aug 7 2026 at 4:39 AM: growbotik-status derived the ops
+  // board's LAST SEND from this door, on a comment reading "recency is the one
+  // axis the ranker never misses." Two indexes were created on cleo.objects
+  // that morning. Creating an index INVALIDATES THE COLLECTION'S PLAN CACHE.
+  // The optimiser re-chose, the arbitrary slice reshuffled, and the board
+  // printed SENT TODAY 18 -- 18 IN THE LAST HOUR -- LAST SEND 2d AGO, all on
+  // one card in one second. The assumption was never true. It was lucky, and
+  // an index build ended the luck.
+  //
+  // Sorting on ingested_at makes this DETERMINISTIC and makes it mean what
+  // every caller already assumed it meant. The scope is { userId }, so
+  // userId_1_ingested_at_-1 provides the order and the regexes are evaluated
+  // as it walks -- the same work, in a defined sequence.
+  //
+  // HONEST COST: for a term that appears only in old records this now walks
+  // further back before filling limit*3, where before it stopped at whatever
+  // it found first. Slower and right beats fast and arbitrary at a door whose
+  // output people make decisions from.
   return await db.collection('objects')
     .find({ ...scope, $or: conditions })
+    .sort({ ingested_at: -1 })
     .limit(limit * 3)
     .toArray();
 }

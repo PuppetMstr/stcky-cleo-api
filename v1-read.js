@@ -73,7 +73,7 @@ function trimObject(o) {
 }
 
 // ============ MODE: NOW ============
-async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWindowDays) {
+async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWindowDays, sourceType) {
   const hoursNum = Math.max(1, Math.min(parseInt(hours) || 24, 168));
   const limitNum = Math.max(1, Math.min(parseInt(limit) || 30, 200));
   // THE REAL CLAMP (found Aug 1 2026). This is what bounds mode:'now' -- the
@@ -114,6 +114,18 @@ async function fanOutNow(db, user, hours, limit, include, anchor, before, maxWin
           .find({
             userId: user._id,
             ingested_at: { $gte: lowerBound, [upperOp]: upperBound },
+            // FILTER AT THE DOOR, NOT IN THE CALLER. Added Aug 7 2026, Eli.
+            //
+            // pulse.html asked for the 6 newest objects and then filtered them
+            // for source_type 'conversation' in the browser. All six came back
+            // machine records -- heartbeats, SENT receipts -- so the card read
+            // "no turns in 24h" beside its own exact count of 59. A filter
+            // applied AFTER a limit is not a filter, it is a coin toss.
+            //
+            // The alternative was to ask for sixty objects and throw away
+            // fifty-four whole bodies, which is the disease this page was just
+            // cured of. Served by userId_1_source_type_1_ingested_at_-1.
+            ...(sourceType ? { source_type: String(sourceType) } : {}),
             ...(inc.events ? {} : { 'metadata.event_type': { $ne: 'tool_event' } }),
           })
           .sort({ ingested_at: -1 })
@@ -406,7 +418,43 @@ async function countBuckets(db, user, body) {
     };
   };
 
+  // =========================================================================
+  // BUCKETS BY SOURCE_TYPE, AND BUCKETS OF EVERYTHING. Added Aug 7 2026, Eli.
+  //
+  // WHY: this door could only be asked "how many records START WITH this
+  // literal string." That is exactly right for the ledger, where every record
+  // is written by a machine with a fixed head -- SENT --, QUEUED --, BOUNCE --.
+  // It is useless for CONVERSATION TURNS, which are whatever Steven or I
+  // happened to say and have no prefix at all.
+  //
+  // So pulse.html -- the page whose entire job is to prove capture is alive --
+  // could not use this door and counted by walking instead: up to 60 paged
+  // reads of /v1/read mode=now per refresh, once a minute, pulling ~1,799 whole
+  // object bodies (~73 MB at the pool's 41.9 kB average) to display four
+  // numbers. Measured Aug 7 2026: ~103 GB a day and ~86,400 requests a day per
+  // open tab, and its own footer had to print a "+" because a walk can only
+  // ever report a floor.
+  //
+  // A bucket may now say `source_type` instead of `prefix`, served by the
+  // existing userId_1_source_type_1_ingested_at_-1 index, or say `all: true`
+  // for every object in the window.  Both are exact totals.
+  //
+  // STRICTLY ADDITIVE. A bucket carrying `prefix` behaves byte-identically to
+  // before, so growbotik-status and the drip's prior-contact checks are
+  // untouched. Only a bucket that asks the new way takes the new path.
+  // =========================================================================
+  const matchForSourceType = (sourceType) => ({
+    match: { userId: user._id, ingested_at: window, source_type: String(sourceType) },
+    path: 'source_type_index',
+  });
+
+  const matchForAll = () => ({
+    match: { userId: user._id, ingested_at: window },
+    path: 'window_index',
+  });
+
   const counts = {};
+  const newest = {};
   const perDay = {};
   const distinct = {};
   const paths = {};
@@ -414,13 +462,51 @@ async function countBuckets(db, user, body) {
   await Promise.all(buckets.map(async (b) => {
     const name = String(b && b.name || '').slice(0, 60);
     const prefix = String(b && b.prefix || '');
-    if (!name || !prefix) return;
+    const sourceType = String(b && b.source_type || '');
+    const wantsAll = !!(b && b.all);
+    if (!name) return;
+    if (!prefix && !sourceType && !wantsAll) return;
 
-    const built = matchFor(prefix);
+    const built = prefix ? matchFor(prefix)
+                : sourceType ? matchForSourceType(sourceType)
+                : matchForAll();
     const match = built.match;
     paths[name] = built.path;
 
     counts[name] = await db.collection('objects').countDocuments(match);
+
+    // NEWEST, AS A FACT. Added Aug 7 2026, Eli.
+    //
+    // WHY: growbotik-status computed every number from this door EXCEPT one --
+    // the timestamp of the most recent send -- which it still took from the
+    // relevance walk, on the stated reasoning that "recency is the one axis the
+    // ranker never misses." On Aug 7 at 4:39 AM that board showed SENT TODAY 18
+    // and 18 IN THE LAST HOUR beside LAST SEND 2d AGO. The counts were right and
+    // the walk-derived timestamp was two days stale, on the same card, in the
+    // same second.
+    //
+    // The ranker had not missed recency because of a bug. objectsKeywordSearch
+    // applies .limit() with NO .sort(), so WHICH matching documents come back is
+    // whatever the chosen query plan yields first -- an arbitrary slice that only
+    // LOOKED recency-ordered. Creating an index invalidates a collection's plan
+    // cache, so the two indexes built that morning reshuffled the arbitrary and
+    // the assumption fell over. It was never true; it was lucky.
+    //
+    // This is the same file's oldest lesson applied one last time: NUMBERS FROM
+    // FACTS, NOT FROM A SEARCH. Sorted on ingested_at, served by the existing
+    // userId_head_ingested_at index, one document, no ranking and no ceiling.
+    const newestDoc = await db.collection('objects')
+      .find(match, { projection: { ingested_at: 1, timestamp: 1, head: 1 } })
+      .sort({ ingested_at: -1 })
+      .limit(1)
+      .next();
+    newest[name] = newestDoc
+      ? {
+          ingested_at: newestDoc.ingested_at || null,
+          timestamp: newestDoc.timestamp || newestDoc.ingested_at || null,
+          head: newestDoc.head ? String(newestDoc.head).slice(0, 120) : null,
+        }
+      : null;
 
     // DISTINCT VALUES PULLED OUT OF THE BODY. Added minutes after count mode,
     // because the first thing it measured raised a question it could not answer.
@@ -457,6 +543,31 @@ async function countBuckets(db, user, body) {
       };
     }
 
+    // DISTINCT BY A REAL FIELD, not by a regex over the body. Aug 7 2026, Eli.
+    //
+    // `extract` above pulls a capture out of `content` because the ledger keeps
+    // the address INSIDE the record text. But `speaker` is an actual field on
+    // every object, and pulse.html was tallying it in JavaScript over 1,799
+    // downloaded bodies to render one line: "Eli 118 . Steven 110 . Chaos 2".
+    //
+    // Same question, asked of the database, over the same indexed match.
+    if (b && b.distinct_field) {
+      const field = String(b.distinct_field).replace(/[^A-Za-z0-9_.]/g, '').slice(0, 60);
+      if (field) {
+        const rows = await db.collection('objects').aggregate([
+          { $match: match },
+          { $group: { _id: '$' + field, n: { $sum: 1 } } },
+          { $sort: { n: -1 } },
+        ]).toArray();
+        distinct[name] = {
+          field,
+          distinct_values: rows.length,
+          records_matched: rows.reduce((a, r) => a + r.n, 0),
+          top: rows.slice(0, 10).map(r => ({ value: r._id, records: r.n })),
+        };
+      }
+    }
+
     if (body.group_by_day) {
       // Bucketed in the caller's own zone, so "Monday" means Monday where Steven
       // is standing -- the same law the pacer and the board already follow.
@@ -476,6 +587,7 @@ async function countBuckets(db, user, body) {
   return {
     counts,
     per_day: body.group_by_day ? perDay : undefined,
+    newest: Object.keys(newest).length ? newest : undefined,
     distinct: Object.keys(distinct).length ? distinct : undefined,
     scanned_by: paths,
     window: { from: since.toISOString(), to: until.toISOString() },
@@ -634,6 +746,7 @@ module.exports = async (req, res) => {
     before,
     cursor,
     max_window_days,
+    source_type,
   } = body;
 
   // =======================================================================
@@ -662,7 +775,7 @@ module.exports = async (req, res) => {
     let result;
     switch (mode) {
       case 'now':
-        result = await fanOutNow(db, user, hours, limit, include, anchor, beforeArg, max_window_days);
+        result = await fanOutNow(db, user, hours, limit, include, anchor, beforeArg, max_window_days, source_type);
         break;
       case 'semantic':
         if (!query) {
@@ -697,6 +810,7 @@ module.exports = async (req, res) => {
           now_human: nowHuman(user),
           mode: 'count',
           counts: result.counts,
+          ...(result.newest ? { newest: result.newest } : {}),
           ...(result.per_day ? { per_day: result.per_day } : {}),
           ...(result.distinct ? { distinct: result.distinct } : {}),
           ...(result.scanned_by ? { scanned_by: result.scanned_by } : {}),
