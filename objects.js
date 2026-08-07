@@ -125,20 +125,40 @@ async function recent(req, res, db, user) {
 
   const filtered = filterNoise(raw).slice(0, limit);
 
-  // Slim payload — the slice render needs timestamp, source_type, speaker,
-  // and a short content snippet. Don't return embeddings or full payloads.
-  const slim = filtered.map(obj => ({
-    _id: String(obj._id),
-    ingested_at: obj.ingested_at || null,
-    timestamp: obj.timestamp || null,
-    source_type: obj.source_type,
-    speaker: obj.speaker || (obj.metadata && obj.metadata.speaker) || null,
-    tool_name: (obj.metadata && obj.metadata.tool_name) || null,
-    session_id: obj.session_id || (obj.metadata && obj.metadata.session_id) || null,
-    content_snippet: typeof obj.content === 'string'
-      ? obj.content.slice(0, 200)
-      : null,
-  }));
+  // v4.24.0 — THE HONEST DOOR.
+  //
+  // This used to return `content_snippet: obj.content.slice(0, 200)` and
+  // NOTHING ELSE. Two hundred characters. No full body, no true length, no
+  // signal that anything had been cut.
+  //
+  // This endpoint feeds the MCP corpus read — which is the WAKE READ. The
+  // first thing the agent does every single morning. So every morning brief
+  // was built on 200-character stubs of the day before, and the agent had no
+  // idea. On July 12 2026 that agent told Steven — on his birthday, about
+  // decisions he had made and shown it screenshots of — that his own
+  // substrate had holes in it. It did not. This line did.
+  //
+  // THE LAW: A FRAGMENT MUST NEVER BE ABLE TO PASS AS A WHOLE.
+  //
+  // Return the body. Return its true length. Let the reader verify. If a
+  // window downstream must shorten, it shortens LOUDLY and points back at
+  // GET /v1/object/:id to redeem the rest.
+  const slim = filtered.map(obj => {
+    const content = typeof obj.content === 'string' ? obj.content : '';
+    return {
+      _id: String(obj._id),
+      ingested_at: obj.ingested_at || null,
+      timestamp: obj.timestamp || null,
+      source_type: obj.source_type,
+      speaker: obj.speaker || (obj.metadata && obj.metadata.speaker) || null,
+      tool_name: (obj.metadata && obj.metadata.tool_name) || null,
+      session_id: obj.session_id || (obj.metadata && obj.metadata.session_id) || null,
+      content,                        // WHOLE. Always.
+      content_length: content.length, // so the reader can VERIFY it
+      truncated: false,
+      content_snippet: content,       // legacy field name, no longer a snippet
+    };
+  });
 
   res.statusCode = 200;
   res.setHeader('Content-Type', 'application/json');
@@ -148,6 +168,70 @@ async function recent(req, res, db, user) {
     window_hours: windowHours,
     limit,
     pre_filter_count: raw.length,
+    complete: true,
+  }));
+}
+
+// --- BY-ID ACTION — THE REDEMPTION DOOR ------------------------------------
+// GET /v1/object/:id
+//
+// Every object in the pool has an id. Every read door hands that id back.
+// And until July 12 2026 there was NOTHING TO REDEEM IT AGAINST — verified
+// against production that morning: /api/objects/:id → 404, /v1/object/:id →
+// 404, /v1/read {mode:"object"} → 400 unknown mode.
+//
+// That is the hole that turns truncation from an annoyance into a lie. A
+// wrapper hands the reader a stub. The reader wants the rest. The reader HAS
+// the id. And the bank will not honor the ticket. So the reader does the only
+// thing left to it: reasons from the piece, hits the ragged end, decides the
+// pool is silent, and fills the silence with something plausible.
+//
+// An id is a promise. This is the house keeping it.
+async function byId(req, res, db, user, id) {
+  let query = null;
+  try {
+    const { ObjectId } = require('mongodb');
+    query = ObjectId.isValid(id)
+      ? { $or: [{ _id: id }, { _id: new ObjectId(id) }] }
+      : { _id: id };
+  } catch (e) {
+    query = { _id: id };
+  }
+  query.userId = user._id;   // sovereignty: your pool, and yours alone
+
+  const obj = await db.collection('objects').findOne(query);
+
+  if (!obj) {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({
+      error: 'object_not_found',
+      id,
+      message: 'No object ' + id + ' in this pool. This is a definitive negative for this ID '
+             + '— it is NOT a truncation, NOT a window limit, and NOT grounds to infer content. '
+             + 'It is also NOT proof that the subject is absent from the pool. Search again in '
+             + 'the user\'s own words before ever telling them something is missing.',
+    }));
+    return;
+  }
+
+  const content = typeof obj.content === 'string' ? obj.content : '';
+
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({
+    object: {
+      _id: String(obj._id),
+      content,                        // WHOLE. No cap. No ellipsis. No preview.
+      content_length: content.length,
+      speaker: obj.speaker || (obj.metadata && obj.metadata.speaker) || null,
+      source_type: obj.source_type,
+      source: obj.source || null,
+      timestamp: obj.timestamp || null,
+      ingested_at: obj.ingested_at || null,
+    },
+    complete: true,
+    truncated: false,
   }));
 }
 
@@ -156,6 +240,8 @@ module.exports = async (req, res) => {
   try {
     const db = await getDb();
     const user = await authenticate(req, db);
+    // THE WALL (Aug 1 2026). A scoped key cannot reach pool content -- see _lib/wall.js.
+    if (require('./_lib/wall').wall(req, res, user, '/api/objects')) return;
     if (!user) {
       res.statusCode = 401;
       res.setHeader('Content-Type', 'application/json');
@@ -163,12 +249,18 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // Route by URL pathname suffix. /api/objects/recent → recent action.
+    // Route by URL pathname suffix.
     const url = new URL(req.url, `http://${req.headers.host}`);
     const path = url.pathname;
 
     if (path.endsWith('/recent')) {
       return await recent(req, res, db, user);
+    }
+
+    // /v1/object/:id  or  /api/objects/:id  → the redemption door.
+    const m = path.match(/^\/(?:v1\/object|api\/objects)\/([^/]+)$/);
+    if (m && m[1]) {
+      return await byId(req, res, db, user, decodeURIComponent(m[1]));
     }
 
     res.statusCode = 404;

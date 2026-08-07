@@ -23,6 +23,80 @@ const MIN_TAIL_CHARS = 400;
 // Default embedding model per Chaos Q3 — same space for all content types.
 const DEFAULT_EMBEDDING_SIZE = 'large'; // text-embedding-3-large, 3072 dims
 
+// ---- THE HEAD: the first line of a record, made indexable ----
+// Added Jul 28 2026, after the drip spent nine hours blocked on
+// "confirmation exceeded 15000ms" and the feeder ran at 15-24s a call.
+//
+// THE COST WAS NEVER THE QUESTION, IT WAS THE SHAPE OF THE ANSWER. Every
+// structural door in this system -- count mode, the prior-contact gate, the
+// drip's database confirmation -- asks the same thing: does a record EXIST
+// whose text STARTS WITH this literal prefix. "SENT -- greg@example.com".
+// "BOUNCE -- greg@example.com". Each of those was a $regex on `content`, and
+// `content` is unindexed and holds whole email bodies, so every one of those
+// questions read every document this user owns, in full, to answer a question
+// about its first sixty characters. Six confirmations = six full-collection
+// scans. That is why the budget ran out on ONE address.
+//
+// You cannot usefully index `content` -- these are multi-kilobyte bodies. But
+// nothing that asks a prefix question needs more than the head of the record.
+// So the head becomes its own small field, written once at ingest, indexed,
+// and a prefix regex against it is an index RANGE SCAN instead of a collection
+// scan. MongoDB optimizes case-sensitive ^-anchored regexes on indexed fields
+// exactly this way; the queries do not change shape, only what they read.
+//
+// 200 chars because the longest prefix any caller uses today is about eighty
+// ("REPLY [OPT_OUT] -- " plus a long address), and the margin costs nothing.
+// The number is exported so the read door can REFUSE the fast path rather than
+// silently truncate a longer prefix -- an undercount here means mailing a man
+// who already said no, so the fallback has to be explicit, not clever.
+const HEAD_CHARS = 200;
+function headOf(text) {
+  return String(text || '').slice(0, HEAD_CHARS);
+}
+
+// ---- THE EMBEDDING, STORED AS BYTES INSTEAD OF AS A THOUSAND NUMBERS ----
+// Aug 5 2026.
+//
+// THE MEASUREMENT. Atlas reports cleo.objects at 42,000 documents averaging
+// 44.02 kB each -- 1.84 GB, and about three quarters of it is not content. An
+// embedding is 3,072 dimensions, and BSON stores an array of numbers as 3,072
+// DOUBLES: eight bytes for the number, plus a key string ("0", "1" ... "3071")
+// and a type byte for every single element. scorer.py's own header measured the
+// exact figures a week ago: 41,911 bytes as an array, 12,303 as float32 binary.
+// 3.41x. The same 44 kB, seen from the storage side.
+//
+// AND WE THROW THE PRECISION AWAY ANYWAY. The scorer's first act on reading one
+// of these is np.asarray(v, dtype=np.float32) -- it converts every double down
+// to a float32 before it does any arithmetic. So the extra four bytes per
+// dimension are stored, indexed, backed up, walked over and paid for, and then
+// discarded on arrival. We are paying to carry precision to a door that throws
+// it away at the threshold.
+//
+// THIS WAS TRIED ONCE AND REFUSED, AND THAT REFUSAL NO LONGER APPLIES.
+// scorer.py's header records binData being rejected because "ENN went 12-70s ->
+// 101-103s" -- but that test was against Atlas $vectorSearch, where the vectors
+// live in a separate mongot index with its own internal representation, so
+// shrinking the collection never shrank the working set. THE SCORER NO LONGER
+// USES $vectorSearch. It holds its own matrix in memory and builds it from
+// whatever bytes arrive. The matrix is bit-identical either way; only the
+// document, the walk and the cold load get smaller.
+//
+// NOTHING IS MIGRATED. scorer.py reads BOTH shapes as of the same morning, so
+// the 42,000 existing rows keep working untouched and new ones simply arrive
+// smaller. There is no cutover, no rewrite, and no moment where half the pool
+// is unreadable. Growth goes from 44 kB a record to about 12.
+//
+// ENDIANNESS: Float32Array and numpy's frombuffer both use native byte order,
+// and both ends run little-endian x86. If a reader ever runs somewhere else,
+// this is the line that breaks and this is the comment that says why.
+function toBinaryEmbedding(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  const f = Float32Array.from(arr);
+  // Copy rather than view the underlying ArrayBuffer -- a view would keep the
+  // whole Float32Array alive and can surprise the BSON serializer.
+  return Buffer.from(new Uint8Array(f.buffer, f.byteOffset, f.byteLength));
+}
+
 // ---- Identity ----
 
 function contentHash(text) {
@@ -200,6 +274,7 @@ async function putObject(db, userId, {
     object_id,
     content_hash: hash,
     content,
+    head: headOf(content),
     content_length: content.length,
     source_type,
     source: source || null,
@@ -213,9 +288,10 @@ async function putObject(db, userId, {
     server_ingest_timestamp,
     timestamp,
     ingested_at: server_ingest_timestamp,
-    embedding: embeddingResult?.embedding || null,
+    embedding: toBinaryEmbedding(embeddingResult?.embedding),
     embedding_model: embeddingResult?.model || null,
     embedding_dims: embeddingResult?.dims || null,
+    embedding_encoding: embeddingResult?.embedding ? 'float32' : null,
     status,
     retry_pending,
     chunk_count: chunks.length,
@@ -279,6 +355,7 @@ async function putObject(db, userId, {
         object_id: chunkObjectId,
         content_hash: chunkHash,
         content: chunkText,
+        head: headOf(chunkText),
         content_length: chunkText.length,
         source_type,
         source: source || null,
@@ -292,9 +369,10 @@ async function putObject(db, userId, {
         server_ingest_timestamp,
         timestamp,
         ingested_at: server_ingest_timestamp,
-        embedding: chunkEmbedding?.embedding || null,
+        embedding: toBinaryEmbedding(chunkEmbedding?.embedding),
         embedding_model: chunkEmbedding?.model || null,
         embedding_dims: chunkEmbedding?.dims || null,
+        embedding_encoding: chunkEmbedding?.embedding ? 'float32' : null,
         status: chunkStatus,
         retry_pending: chunkRetryPending,
         chunk_count: 1,
@@ -340,6 +418,16 @@ async function ensureObjectIndexes(db) {
   await db.collection('objects').createIndex({ userId: 1, session_id: 1, turn_index: 1 });
   await db.collection('objects').createIndex({ userId: 1, parent_object_id: 1, chunk_index: 1 });
   await db.collection('objects').createIndex({ userId: 1, retry_pending: 1 });
+
+  // THE INDEX THAT ENDS THE COLLECTION SCAN. Jul 28 2026.
+  // userId first (every query is user-scoped), then head (the prefix range),
+  // then ingested_at so the time window is satisfied inside the same index
+  // rather than by fetching documents. A prefix count now touches index keys
+  // only -- it never has to open a single email body.
+  await db.collection('objects').createIndex(
+    { userId: 1, head: 1, ingested_at: 1 },
+    { name: 'userId_head_ingested_at' }
+  );
 }
 
 module.exports = {
@@ -349,6 +437,8 @@ module.exports = {
   objectIdFromHash,
   buildProvenance,
   ensureObjectIndexes,
+  headOf,
+  HEAD_CHARS,
   CHUNK_THRESHOLD_CHARS,
   TARGET_CHUNK_CHARS,
   DEFAULT_EMBEDDING_SIZE,

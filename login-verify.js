@@ -83,7 +83,18 @@ module.exports = async function handler(req, res) {
     // Redirect to frontend with apiKey in URL fragment.
     // Fragment is intentional -- it never gets sent to servers / logs,
     // and the frontend reads it via window.location.hash on load.
-    const target = `${FRONTEND_BASE}/#apiKey=${encodeURIComponent(user.apiKey)}`;
+    //
+    // LAND THEM WHERE THEY STARTED (Jul 18 2026). If the sign-in came from a
+    // specific surface -- the voice app, say -- send them back to it instead of
+    // the home page. Signing in and arriving somewhere else is how a person
+    // concludes it did not work.
+    //
+    // The path was validated as same-origin at issue time and stored on the
+    // one-time token, so nothing a caller sends now can change the destination.
+    const dest = (record.next && /^\/[A-Za-z0-9._~\-\/]*$/.test(record.next))
+      ? record.next
+      : '/';
+    const target = `${FRONTEND_BASE}${dest}#apiKey=${encodeURIComponent(user.apiKey)}`;
     res.statusCode = 302;
     res.setHeader('Location', target);
     return res.end();

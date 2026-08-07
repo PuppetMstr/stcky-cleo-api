@@ -137,14 +137,14 @@ async function auth(req) {
   // Check query param (for GET requests via MCP)
   const apiKeyParam = req.query && req.query.apiKey;
   if (apiKeyParam) {
-    const user = await lookup({ apiKey: apiKeyParam }, 'query.apiKey');
+    const user = (await lookup({ apiKey: apiKeyParam }, 'query.apiKey')) || (await lookup({ 'keys.key': apiKeyParam }, 'query.apiKey scoped'));
     if (user) return user;
   }
 
   // Check X-API-Key header
   const apiKey = req.headers['x-api-key'];
   if (apiKey) {
-    const user = await lookup({ apiKey }, 'x-api-key header');
+    const user = (await lookup({ apiKey }, 'x-api-key header')) || (await lookup({ 'keys.key': apiKey }, 'x-api-key scoped'));
     if (user) return user;
   }
 
@@ -159,7 +159,8 @@ async function auth(req) {
 
   // API key format (cleo_)
   if (token.startsWith('cleo_')) {
-    const user = await lookup({ apiKey: token }, 'cleo_ bearer');
+    // SCOPED KEYS (Aug 1 2026): a user may carry keys:[{key,scope,label}] alongside apiKey.
+    const user = (await lookup({ apiKey: token }, 'cleo_ bearer')) || (await lookup({ 'keys.key': token }, 'cleo_ bearer scoped'));
     if (user) return user;
     console.log('[AUTH] cleo_ token not found in database');
     return null;
@@ -201,7 +202,7 @@ async function auth(req) {
   }
 
   // Fallback: try as API key
-  const user = await lookup({ apiKey: token }, 'fallback');
+  const user = (await lookup({ apiKey: token }, 'fallback')) || (await lookup({ 'keys.key': token }, 'fallback scoped'));
   if (user) return user;
 
   console.log('[AUTH] No matching auth method found');

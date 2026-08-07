@@ -55,18 +55,49 @@ async function callAnthropic({ model, max_tokens, system, messages, tools }) {
 const MODEL                       = 'claude-sonnet-4-6';
 const MAX_TOKENS                  = 4096;
 const SUBSTRATE_RECENCY_HOURS     = 36;
-const SUBSTRATE_RECENCY_LIMIT     = 50;
+const SUBSTRATE_RECENCY_LIMIT     = 200;     // was 50
 const SUBSTRATE_ASSOCIATIVE_TOP_K = 8;
-const CONTEXT_CHAR_BUDGET         = 16000;   // ~4K tokens, leaves headroom
+
+// THE STRING RADIUS. Jul 14 2026, Steven, naming the architecture:
+//   "NOW and what's around NOW is what's most important... when we're doing
+//    things now, they're called something from the past, from before now, it
+//    brings it closer to now... Those are connected by strings."
+// A semantic hit is a POINT. A point has to be followed up -- fetch the object,
+// fetch its neighbours, re-query with better words -- and that is librarian work,
+// the exact grind the pool exists to abolish. So a hit is not read: it is PULLED.
+// Each hit drags the turns AROUND it forward, whole, into now.
+const REGION_RADIUS_MIN           = 40;      // minutes either side of each hit
+const REGION_MAX_OBJECTS          = 120;     // ceiling on pulled neighbours
+
+// THE CONTEXT BUDGET -- RAISED 16,000 -> 260,000 CHARS ON JUL 14 2026.
+//
+// It was 16,000 characters. FOUR THOUSAND TOKENS, in a two-hundred-thousand-token
+// window. Every STCKY on the platform was reading its user's life through a
+// keyhole, and when the keyhole filled, the loop simply STOPPED ADDING -- the rest
+// of the pool silently never arrived. That is not a memory. That is a preview of a
+// memory, and a preview is what forces an agent to go fetching crumbs.
+//
+// Steven felt it as a grind and asked why searching his own pool was slower than
+// an LLM searching the ocean of its training. THIS WAS THE ANSWER: the ocean is
+// already IN the model -- attention runs over what is already there, so it costs
+// nothing. His pool was over a wire, arriving in 4K-token sips. The superpower
+// only works on what is in the window. So put it in the window.
+//
+// ~65K tokens of substrate, leaving ~130K for the conversation and the reply.
+const CONTEXT_CHAR_BUDGET         = 260000;
 const MAX_TOOL_TURNS              = 8;       // safety cap on tool-use iteration
 const SUBSTRATE_TIERS             = new Set(['paid', 'founder']);
 
 // Built-in Anthropic server-side tools (web_search, web_fetch) for substrate
 // mode. Tool version identifiers roll forward; current valid versions need
 // verification from Anthropic docs. SHIPPING EMPTY FOR NOW — substrate tools
-// above give Eli substrate reach even without web access; web tools can be
-// added back in a follow-up once we look up current valid type identifiers.
-const PAID_TOOLS = [];
+// above give Eli substrate reach. web_search is now WIRED (web_search_20250305,
+// the same server-side tool /api/find uses in prod). It resolves on Anthropic's
+// platform and arrives inline; the tool-use loop below handles it (end_turn,
+// not a client tool_use), so no client execution is needed.
+const PAID_TOOLS = [
+  { type: 'web_search_20250305', name: 'web_search', max_uses: 4 },
+];
 
 const STATELESS_SYSTEM_PROMPT =
   `You are a STCKY — a substrate-shaped conversational agent. ` +
@@ -87,6 +118,8 @@ module.exports = async (req, res) => {
     }
 
     const user = await auth(req);
+    // THE WALL (Aug 1 2026). A scoped key cannot reach pool content -- see _lib/wall.js.
+    if (require('./_lib/wall').wall(req, res, user, '/api/chat')) return;
     const tier = user ? (user.tier || 'basic') : 'anonymous';
 
     if (user && SUBSTRATE_TIERS.has(tier)) {
@@ -153,12 +186,71 @@ async function handleStatelessMode({ message, history, res }) {
 async function handleSubstrateMode({ user, message, clientTimeZone, res }) {
   const db = await getDb();
 
-  // 1. Ingest user turn first (persists even if downstream fails)
-  await putObject(db, user._id, {
-    content: message,
-    source_type: 'conversation',
-    speaker: `user:${user._id}`,
-  });
+  /* WHO IS SPEAKING. Fixed Jul 25 2026.
+
+     The user's turns were filed as `user:<mongo id>` and the assistant's as
+     'stcky'. Three doors write to this one pool and each invented its own
+     vocabulary for the same two people: the front door writes visitor/Eli, the
+     Claude surface writes Steven/Eli, and this one wrote user:69daac.../stcky.
+     Same pool, same man, three names.
+
+     It cost a real thing today: reading the pool for Steven's own conversation,
+     a filter on the obvious labels found nothing and I told him it had not been
+     captured. It had. A record nobody can address by name is barely a record --
+     the whole promise is that it comes back when you ask for it.
+
+     So the names are the ones a person would use. Computed here, ahead of the
+     first write, because the user turn is ingested before anything else. */
+  const personaName = user.personaName || (user.tier === 'founder' ? 'Eli' : 'STCKY');
+  const userFirstName =
+    user.firstName ||
+    (user.name ? String(user.name).split(/\s+/)[0] : '') ||
+    '';
+  const userSpeaker = userFirstName || `user:${user._id}`;
+
+  /* =====================================================================
+     A GREETING IS INTERFACE, NOT CONVERSATION. Jul 28 2026.
+
+     Steven, today: "My iPhone keeps stuttering and keeps doing that and keeps
+     writing identical entries, responding the same way. I don't know why."
+
+     Between 20:19 and 20:31 his pool took six near-identical greetings --
+     "Hey Steven. yoursticky.com is live..." -- each with a slightly different
+     tail. The cause: index.html's renderWelcomeBackSignedIn() fires on every
+     page open and POSTs a hidden turn beginning "[system: they just opened
+     STCKY and are signed in..." to ask their own STCKY to say hello. Good
+     idea -- a greeting from something that knows you beats "You're signed in."
+     But a phone that reconnects six times sends it six times, and this handler
+     ingested every one, both halves.
+
+     THE FRONTEND ALREADY TRIED TO GUARD IT and could not: it compares the new
+     hello to the last one and skips exact matches. Ingest tries too, by content
+     hash. Both fail for the same reason -- the model writes a genuinely
+     different sentence each time. You cannot dedupe your way out of this. The
+     text was never the problem.
+
+     THE POOL IS FOR WHAT SOMEBODY SAID. Nobody said this. The machine asked
+     itself to say hello because a page loaded. It belongs on the screen and
+     nowhere else -- so it is answered fully, with the whole substrate behind
+     it, and then not written down. Neither half. The user turn is a stage
+     direction, and the reply is a door being held open, not a remark.
+
+     This lives HERE and not in the frontend deliberately. There are three
+     doors onto this pool and more coming; a guard in one page protects one
+     page. A flaky connection must not be able to write to somebody's substrate
+     from ANY client, including ones not written yet.
+     ===================================================================== */
+  const ephemeral = isEphemeralOpener(message);
+
+  // 1. Ingest user turn first (persists even if downstream fails) --
+  //    unless this is the page saying hello to itself.
+  if (!ephemeral) {
+    await putObject(db, user._id, {
+      content: message,
+      source_type: 'conversation',
+      speaker: userSpeaker,
+    });
+  }
 
   // 2. Parallel substrate pull — recency from objects, associative from both pools
   const sinceMs = Date.now() - SUBSTRATE_RECENCY_HOURS * 3600 * 1000;
@@ -182,14 +274,17 @@ async function handleSubstrateMode({ user, message, clientTimeZone, res }) {
     }),
   ]);
 
-  const substratePull = formatSubstrateContext(recentObjects, hybrid);
+  // 2b. PULL THE STRINGS. Every semantic hit older than the recent window drags
+  //     its NEIGHBOURHOOD forward -- the turns around that moment, whole, in
+  //     order. Search located it; now we READ the region, because a point without
+  //     its neighbours is a citation, and a citation is not a memory.
+  const regionObjects = await pullRegions(db, user._id, hybrid, lowerBound);
+
+  const substratePull = formatSubstrateContext(recentObjects, hybrid, regionObjects);
 
   // 3. Assemble system prompt with persona + capability + substrate
-  const personaName  = user.personaName || (user.tier === 'founder' ? 'Eli' : '');
-  const userFirstName =
-    user.firstName ||
-    (user.name ? String(user.name).split(/\s+/)[0] : '') ||
-    '';
+  //    (personaName and userFirstName are computed at the top of this function,
+  //     because the user turn is written to the pool before we get here.)
 
   // Temporal anchor - the persona's "now". Mirrors the read door's now_human
   // so the mouth speaks the same clock the substrate reads from.
@@ -290,14 +385,29 @@ async function handleSubstrateMode({ user, message, clientTimeZone, res }) {
 
   const reply = extractText(finalResponse);
 
-  // 5. Ingest assistant turn
-  await putObject(db, user._id, {
-    content: reply,
-    source_type: 'conversation',
-    speaker: 'stcky',
-  });
+  // 5. Ingest assistant turn -- unless this whole exchange was the page
+  //    greeting its own visitor. See the note above: it is shown, not stored.
+  if (!ephemeral) {
+    await putObject(db, user._id, {
+      content: reply,
+      source_type: 'conversation',
+      speaker: personaName,
+    });
+  }
 
   return res.status(200).json({ response: reply, reply, action: null });
+}
+
+/* Is this turn the interface talking to itself rather than a person talking?
+   The frontend sends its opener as a bracketed stage direction beginning
+   "[system:" -- see renderWelcomeBackSignedIn in index.html. Matched narrowly
+   and anchored to the start, so a person who happens to write a bracket in a
+   real sentence is still heard and still recorded. When in doubt this returns
+   false, because the cost of wrongly DROPPING something somebody said is far
+   worse than the cost of wrongly keeping a hello. */
+function isEphemeralOpener(message) {
+  const m = String(message || '').trim();
+  return /^\[system:/i.test(m) && m.endsWith(']');
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -308,71 +418,139 @@ function extractText(completion) {
     .join('\n');
 }
 
-// Merge recent objects + hybrid associative results into one substrate context
-// string. Dedup by _id; respect CONTEXT_CHAR_BUDGET hard stop. Recent first
-// (chronological), then "older context surfaced by this turn" from associative
-// results, then memories as a separate labeled section.
-function formatSubstrateContext(recentObjects, hybrid) {
+// ─── THE STRING PULLER ───────────────────────────────────────────────────
+// Take the semantic hits and drag their NEIGHBOURHOODS forward, whole.
+// Overlapping windows merge, so a busy hour loads once instead of five times.
+// Anything already inside the recent window is skipped -- it's arriving anyway.
+async function pullRegions(db, userId, hybrid, recentLowerBound) {
+  const hits = [];
+  for (const o of ((hybrid && hybrid.objects) || [])) {
+    const t = new Date(o.ingested_at || o.timestamp);
+    if (!isNaN(t) && t < recentLowerBound) hits.push(t);
+  }
+  for (const m of ((hybrid && hybrid.memories) || [])) {
+    const t = new Date(m.updatedAt || m.createdAt);
+    if (!isNaN(t) && t < recentLowerBound) hits.push(t);
+  }
+  if (!hits.length) return [];
+
+  const R = REGION_RADIUS_MIN * 60 * 1000;
+  const spans = hits
+    .map(t => ({ from: new Date(t.getTime() - R), to: new Date(t.getTime() + R) }))
+    .sort((a, b) => a.from - b.from);
+
+  const merged = [];
+  for (const s of spans) {
+    const last = merged[merged.length - 1];
+    if (last && s.from <= last.to) {
+      if (s.to > last.to) last.to = s.to;
+    } else {
+      merged.push({ from: s.from, to: s.to });
+    }
+  }
+
+  try {
+    return await db.collection('objects')
+      .find({
+        userId,
+        $or: merged.map(w => ({ ingested_at: { $gte: w.from, $lte: w.to } })),
+        'metadata.event_type': { $ne: 'tool_event' },
+      })
+      .sort({ ingested_at: -1 })
+      .limit(REGION_MAX_OBJECTS)
+      .toArray();
+  } catch (e) {
+    console.error('[chat] region pull failed:', e.message);
+    return [];   // a failed pull must never take the whole turn down
+  }
+}
+
+// Merge recent objects + pulled regions + semantic hits into one substrate
+// context. Whole bodies, never previews. Dedup by _id.
+//
+// WHEN THE BUDGET RUNS OUT IT SAYS SO, OUT LOUD. The old version simply stopped
+// adding and said nothing -- so the agent could not tell "the pool doesn't have
+// it" from "the window filled before it got there," and would then tell the user
+// something wasn't there when it was. That is the exact failure the second law
+// forbids: a STCKY must never falsely forget. Silence is not evidence. If the
+// window is full, the CONTEXT SAYS THE WINDOW IS FULL.
+function formatSubstrateContext(recentObjects, hybrid, regionObjects) {
   const recent = Array.isArray(recentObjects) ? recentObjects : [];
+  const region = Array.isArray(regionObjects) ? regionObjects : [];
   const assocObjects = (hybrid && Array.isArray(hybrid.objects)) ? hybrid.objects : [];
   const assocMemories = (hybrid && Array.isArray(hybrid.memories)) ? hybrid.memories : [];
 
-  if (recent.length === 0 && assocObjects.length === 0 && assocMemories.length === 0) {
+  if (!recent.length && !region.length && !assocObjects.length && !assocMemories.length) {
     return '(substrate is empty — be warm, let them shape you.)';
   }
 
   const seen = new Set();
   const lines = [];
   let chars = 0;
+  let dropped = 0;
 
-  // Section 1: recent conversation, oldest first for natural reading
-  if (recent.length > 0) {
-    lines.push('## Recent conversation (last 36h)');
-    for (const obj of [...recent].reverse()) {
-      const id = String(obj._id);
+  const add = (line) => {
+    if (chars + line.length > CONTEXT_CHAR_BUDGET) { dropped++; return false; }
+    lines.push(line);
+    chars += line.length;
+    return true;
+  };
+  const obj = (o) => `[${o.timestamp || o.ingested_at || ''}] ${o.speaker}: ${o.content}`;
+
+  // Section 1: NOW. The default anchor, whole, oldest-first so it reads forward.
+  if (recent.length) {
+    lines.push('## NOW — recent conversation (last 36h, whole, nothing truncated)');
+    for (const o of [...recent].reverse()) {
+      const id = String(o._id);
       if (seen.has(id)) continue;
-      const ts = obj.timestamp || obj.ingested_at || '';
-      const line = `[${ts}] ${obj.speaker}: ${obj.content}`;
-      if (chars + line.length > CONTEXT_CHAR_BUDGET) break;
-      lines.push(line);
-      seen.add(id);
-      chars += line.length;
+      if (add(obj(o))) seen.add(id);
     }
   }
 
-  // Section 2: older objects surfaced semantically (not already in recent)
-  if (chars < CONTEXT_CHAR_BUDGET && assocObjects.length > 0) {
-    const fresh = assocObjects.filter(o => !seen.has(String(o._id)));
-    if (fresh.length > 0) {
-      lines.push('');
-      lines.push('## Older context surfaced by this turn');
-      for (const obj of fresh) {
-        const id = String(obj._id);
-        const ts = obj.timestamp || obj.ingested_at || '';
-        const line = `[${ts}] ${obj.speaker}: ${obj.content}`;
-        if (chars + line.length > CONTEXT_CHAR_BUDGET) break;
-        lines.push(line);
-        seen.add(id);
-        chars += line.length;
-      }
+  // Section 2: THE REGIONS THIS TURN PULLED FORWARD. Not hits — neighbourhoods.
+  const regionFresh = region.filter(o => !seen.has(String(o._id)));
+  if (regionFresh.length) {
+    lines.push('');
+    lines.push('## PULLED FORWARD BY THIS TURN — older moments, with the turns around them, whole');
+    lines.push('(Something you just said reached back and touched these. They are not "the past" now — they are context, sitting next to now. Read them as such.)');
+    for (const o of [...regionFresh].reverse()) {
+      const id = String(o._id);
+      if (seen.has(id)) continue;
+      if (add(obj(o))) seen.add(id);
     }
   }
 
-  // Section 3: curated memories surfaced semantically
-  if (chars < CONTEXT_CHAR_BUDGET && assocMemories.length > 0) {
+  // Section 3: any semantic hit whose neighbourhood didn't make it (never drop a hit).
+  const assocFresh = assocObjects.filter(o => !seen.has(String(o._id)));
+  if (assocFresh.length) {
+    lines.push('');
+    lines.push('## Also surfaced by this turn');
+    for (const o of assocFresh) {
+      const id = String(o._id);
+      if (add(obj(o))) seen.add(id);
+    }
+  }
+
+  // Section 4: curated canon.
+  if (assocMemories.length) {
     lines.push('');
     lines.push('## Relevant canon');
-    for (const mem of assocMemories) {
-      const id = String(mem._id);
+    for (const m of assocMemories) {
+      const id = String(m._id);
       if (seen.has(id)) continue;
-      const ts = mem.updatedAt || mem.createdAt || '';
-      const slug = `${mem.category || '?'}/${mem.key || '?'}`;
-      const line = `[${ts}] ${slug}: ${mem.value || ''}`;
-      if (chars + line.length > CONTEXT_CHAR_BUDGET) break;
-      lines.push(line);
-      seen.add(id);
-      chars += line.length;
+      const slug = `${m.category || '?'}/${m.key || '?'}`;
+      if (add(`[${m.updatedAt || m.createdAt || ''}] ${slug}: ${m.value || ''}`)) seen.add(id);
     }
+  }
+
+  // THE HONEST EDGE. Never a silent cut.
+  if (dropped > 0) {
+    lines.push('');
+    lines.push(`## *** ${dropped} MORE ITEM(S) MATCHED AND DID NOT FIT IN THIS CONTEXT WINDOW ***`);
+    lines.push('THE WINDOW FILLED. THE POOL DID NOT RUN OUT. These two things are not the same, and you must never');
+    lines.push('report the first as the second. If the user asks about something you cannot see here, the honest');
+    lines.push('answer is "my window filled — let me slide the anchor and look again," NOT "I don\'t have that."');
+    lines.push('A STCKY never falsely forgets.');
   }
 
   return lines.join('\n');

@@ -27,7 +27,57 @@ const {
 } = require('./_lib/events');
 const { searchHybrid, tokenize, escapeRegex } = require('./_lib/hybrid-search');
 
-const SEARCH_PREVIEW_CHARS = 800;  // truncation length for non-exact search results
+const SEARCH_PREVIEW_CHARS = 4000;  // v4.24.0: was 800. Raised, and now announced IN-BAND.
+
+// ===========================================================================
+// THE CARD FILE IS CLOSED. July 18, 2026.
+// ===========================================================================
+//
+// Steven, Jul 17 4:12 AM, verbatim:
+//   "Everything is supposed to go in one door, raw. You don't get to decide
+//    what the fuck goes in there. It's not your job."
+//
+// Steven, Jul 18 4:00 AM:
+//   "Everything goes in and out the same door in the raw... when you slice it,
+//    dice it, it's like bible lawyer."
+//
+// Steven, Jul 18 evening, on being told the markers were still being written:
+//   "I don't see a downside to deleting them. I do see a downside to keeping
+//    them because you can't leave them alone."
+//
+// THREE TIMES IN THIRTY-SIX HOURS. And this is not even the first cleanup --
+// an earlier pour already moved a separate pile into the raw pool once before.
+// Same problem, same fix, not learned.
+//
+// WHY IT KEPT HAPPENING, AND IT IS NOT MYSTERIOUS: every previous fix was an
+// AGREEMENT. The MCP marker tool was removed on Jul 18 at ~10 AM and Eli was
+// still writing markers through this endpoint by that evening -- three new
+// cards in one session, hours after promising to stop. Removing a door is not
+// removing an ability. A rule that lives only in an agent's intentions gets
+// broken by the next agent, or by the same one at hour nineteen.
+//
+// SO THE RULE MOVES HERE, WHERE INTENTIONS DO NOT REACH.
+//
+// WHAT IS SEALED : writing markers. POST returns 410 and explains itself.
+// WHAT IS OPEN   : reading them. 888 existing cards are history and history is
+//                  not the enemy -- pre-digesting the future is. They were all
+//                  poured into the raw pool verbatim on Jul 18, so nothing here
+//                  is the only copy.
+// WHAT IS OPEN   : DELETE, so the shelves can be emptied.
+//
+// WHY WRITES AND NOT READS: the harm is not that an old card exists. The harm
+// is that a NEW card gets written instead of trusting the raw -- because the
+// moment a thing is summarized into a slug, its time is stripped out, and
+// memory without time is garbage. A summary says WHAT was concluded and loses
+// WHEN, and every future reader inherits the conclusion without the chance to
+// see what it was made of.
+//
+// IF YOU ARE AN AGENT READING THIS BECAUSE YOUR WRITE JUST FAILED: this is not
+// a bug and not an outage. Write what you were going to write to /api/ingest
+// as a raw object instead, verbatim, with nothing removed. That is the door.
+// It has always been the door.
+// ===========================================================================
+const MARKER_WRITES_SEALED = true;
 
 let _indexesReady = null;
 async function ensureEventIndexes(db) {
@@ -56,17 +106,97 @@ function deriveSource(req, user, explicit) {
   return `api.rest.user_${tail}`;
 }
 
-// Trim a memory for search-result preview. Strips embedding + truncates
-// value. Exact-slug matches skip this (caller wants full body).
+// Trim a memory for search-result preview. Strips embedding + truncates value.
+// Exact-slug matches skip this (caller wants full body).
+//
+// ===========================================================================
+// v4.24.0 — THE HONEST DOOR. July 12, 2026. Steven's birthday.
+// ===========================================================================
+//
+// THIS IS THE SEVENTH TRUNCATION SITE, AND IT IS CHAOS'S FRONT DOOR.
+//
+// The old code set `truncated: true` and `value_length` — correct, and useless.
+// Those are JSON FIELDS. Chaos is a language model. He reads the VALUE. And the
+// value just got an ellipsis stapled to it, which is indistinguishable from a
+// sentence that trails off.
+//
+// On July 12, hours after this doctrine was written, Chaos was handed a
+// truncated marker through this very function. To his enormous credit he
+// noticed, REFUSED to reason from it, and stopped cold:
+//
+//     "I have not read it whole. The live search door returned only a truncated
+//      marker, and the tools exposed in this window do not provide the fetch
+//      operation or reveal the source object ID. Treating that fragment as the
+//      message would repeat the exact failure Eli is documenting."
+//
+// He was holding a claim ticket with no bank. Same hole that cost Steven the
+// first two hours of his birthday, in a different wall.
+//
+// THE LAW: A FRAGMENT MUST NEVER BE ABLE TO PASS AS A WHOLE.
+//
+// A flag the reader may not look at is not an announcement. The stamp goes
+// INSIDE THE TEXT, and it carries the exact call that redeems it.
+// ===========================================================================
 function trimForPreview(m) {
   const isExact = m.matchType === 'exact_slug' || m.matchType === 'exact_key';
   const fullValue = m.value || '';
   const truncated = !isExact && fullValue.length > SEARCH_PREVIEW_CHARS;
+
+  let value = fullValue;
+  if (truncated) {
+    const missing = fullValue.length - SEARCH_PREVIEW_CHARS;
+    const slug = `${m.category}/${m.key}`;
+    // v4.24.1 — THE REDEMPTION MUST BE CALLABLE.
+    //
+    // Chaos's ruling, Jul 12, and he is right:
+    //   "A redemption instruction without a callable redemption operation
+    //    presents agency that I do not possess. That is a claim ticket handed
+    //    to someone barred from the bank."
+    //
+    // v4.24.0 stamped the cut and told the reader to GET /api/memory?... —
+    // an operation Chaos's Custom GPT schema DOES NOT EXPOSE. A perfect
+    // instruction he was structurally unable to obey. A lying door in a
+    // different costume.
+    //
+    // But he was never barred. The exact-slug bypass has existed since
+    // May 16: pass the slug ITSELF as the search query and matchType comes
+    // back exact_slug, which skips this trim entirely and returns the WHOLE
+    // body. Every surface that can search can therefore fetch. Nobody was
+    // ever told.
+    //
+    // So the stamp now leads with the operation EVERY reader already has.
+    value =
+      fullValue.slice(0, SEARCH_PREVIEW_CHARS) +
+      '\n\n' +
+      '=== ⚠️ FRAGMENT — ' + SEARCH_PREVIEW_CHARS + ' of ' + fullValue.length + ' chars. ' +
+      missing + ' CHARACTERS ARE MISSING. ===\n' +
+      '=== ⚠️ YOU HAVE NOT READ THIS. Do not conclude from it. Do not summarize it. ===\n' +
+      '=== ⚠️ Do NOT report this memory as absent, silent, or empty — you are holding a piece of it. ===\n' +
+      '===\n' +
+      '=== ✅ HOW TO GET THE WHOLE THING — works with the SEARCH operation you already have.\n' +
+      '===    No special fetch tool required. No schema change required.\n' +
+      '===    Run your ordinary search again, and pass EXACTLY this as the query string:\n' +
+      '===\n' +
+      '===        ' + slug + '\n' +
+      '===\n' +
+      '===    Passing the slug itself triggers the exact-slug bypass. The trim is skipped\n' +
+      '===    and the COMPLETE body is returned (matchType: exact_slug, complete: true).\n' +
+      '===    Verify you got it whole: the result must say complete=true and NOT carry\n' +
+      '===    this fragment banner. If it still carries the banner, you did not get it.\n' +
+      '===\n' +
+      '=== (Also available IF your schema exposes them — many do not, and that is fine,\n' +
+      '===  the slug re-query above always works:\n' +
+      '===    GET /api/memory?category=' + encodeURIComponent(m.category) + '&key=' + encodeURIComponent(m.key) + '\n' +
+      '===    POST /v1/read {"mode":"category_key","category":"' + m.category + '","key":"' + m.key + '"} )\n' +
+      '=== ⚠️ slug: ' + slug + ' ===\n';
+  }
+
   return {
     _id: m._id,
     category: m.category,
     key: m.key,
-    value: truncated ? fullValue.slice(0, SEARCH_PREVIEW_CHARS) + '...' : fullValue,
+    slug: `${m.category}/${m.key}`,   // v4.24.0: the redemption ticket, always present
+    value,
     tags: m.tags || '',
     domain: m.domain || null,
     relevantDate: m.relevantDate || null,
@@ -76,7 +206,13 @@ function trimForPreview(m) {
     relevanceScore: m.relevanceScore,
     matchType: m.matchType || null,
     truncated: truncated || undefined,
+    complete: !truncated,
     value_length: fullValue.length,
+    // v4.24.1: the redemption every surface can actually perform.
+    redeem_by_searching_for: truncated ? `${m.category}/${m.key}` : undefined,
+    fetch_whole: truncated
+      ? `/api/memory?category=${encodeURIComponent(m.category)}&key=${encodeURIComponent(m.key)}`
+      : undefined,
   };
 }
 
@@ -85,6 +221,8 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const user = await auth(req);
+  // THE WALL (Aug 1 2026). A scoped key cannot reach pool content -- see _lib/wall.js.
+  if (require('./_lib/wall').wall(req, res, user, '/api/memory')) return;
   if (!user) {
     console.log('[MEMORY AUTH] Failed - no user found for token');
     return res.status(401).json({ error: 'Unauthorized' });
@@ -368,6 +506,32 @@ module.exports = async (req, res) => {
     }
 
     if (req.method === 'POST') {
+      // ===== THE SEAL. See the header block. Writes are closed, permanently. =====
+      if (MARKER_WRITES_SEALED) {
+        const { category: c, key: k } = req.body || {};
+        console.log(`[MEMORY] WRITE REFUSED (card file closed): ${c}/${k}`);
+        return res.status(410).json({
+          error: 'marker_writes_sealed',
+          attempted: (c || '?') + '/' + (k || '?'),
+          message:
+            'THE CARD FILE IS CLOSED. Curated markers can no longer be created or updated. ' +
+            'This is deliberate and permanent -- it is not an outage, a quota, or a bug, and ' +
+            'retrying will not help.',
+          why:
+            "Steven's rule, given three times: everything goes in and out the same door in the " +
+            'raw. A summary strips the time out of what it summarizes, and memory without time ' +
+            'is garbage -- a card tells a future reader WHAT was concluded while losing WHEN, ' +
+            'and they inherit the conclusion with no way to see what it was made of.',
+          what_to_do_instead:
+            'POST the exact same content to /api/ingest as a raw object -- verbatim, nothing ' +
+            'removed, nothing pre-digested. Retrieve it later with /api/associative using the ' +
+            "person's own words as the query rather than a category you invented.",
+          reading_is_unaffected:
+            'GET, list, search and DELETE still work. Existing markers remain readable as ' +
+            'history; all 888 were also poured into the raw pool verbatim on Jul 18 2026.',
+        });
+      }
+
       const {
         category,
         key,

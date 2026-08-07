@@ -5,6 +5,8 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const user = await auth(req);
+  // THE WALL (Aug 1 2026). A scoped key cannot reach pool content -- see _lib/wall.js.
+  if (require('./_lib/wall').wall(req, res, user, '/api/sessions')) return;
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
   const db = await getDb();

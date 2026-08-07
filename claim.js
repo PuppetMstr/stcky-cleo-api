@@ -1,9 +1,12 @@
 // /api/claim.js  (drops in at C:\Stcky\cleo-api\claim.js)
 //
-// STCKY save-by-conversation endpoint.
-// Called from stcky.ai when a user submits the inline save form.
+// STCKY signup + save endpoint.
+// Called from stcky.ai — either the classic name+email signup form, OR the
+// inline save-by-conversation form.
 //
-// Takes: { email, name, turns: [{role:'sticky'|'user', text:'...'}] }
+// Takes: { email, name, turns?: [{role:'sticky'|'user', text:'...'}] }
+//   - turns is OPTIONAL as of 2026-06-25. A plain name+email signup with no
+//     prior conversation is valid; when turns are present they're ingested.
 // Returns: { token, name, user_id }
 //   on duplicate email: 409 { error:'email_exists' }
 //   on bad input:        400 { error:'invalid_*' }
@@ -11,7 +14,9 @@
 // Side effects:
 //   1. Inserts a new doc into the `users` collection with email/firstName/
 //      lastName/apiKey matching the schema the auth path reads.
-//   2. Ingests every pre-auth turn into the substrate under the new apiKey,
+//      New users land tier:'paid' (full substrate from message one — "full
+//      Monty"; throttle later if/when we choose).
+//   2. Ingests any pre-auth turns into the substrate under the new apiKey,
 //      via internal POST to /api/ingest (same Vercel project).
 //
 // Uses _lib/auth's getDb() + cors() helpers to match cleo-api conventions.
@@ -39,15 +44,13 @@ module.exports = async function handler(req, res) {
   body = body || {};
   const email = (typeof body.email === 'string') ? body.email.trim().toLowerCase() : '';
   const name = (typeof body.name === 'string') ? body.name.trim() : '';
-  const turns = Array.isArray(body.turns) ? body.turns : null;
+  // turns OPTIONAL: default to empty array when absent/invalid (classic signup)
+  const turns = Array.isArray(body.turns) ? body.turns : [];
   if (!EMAIL_RE.test(email)) {
     return res.status(400).json({ error: 'invalid_email' });
   }
   if (!name) {
     return res.status(400).json({ error: 'invalid_name' });
-  }
-  if (!turns) {
-    return res.status(400).json({ error: 'invalid_turns' });
   }
 
   // Optional referral capture. If body.referrer_token is provided and matches
@@ -92,9 +95,9 @@ module.exports = async function handler(req, res) {
       firstName,
       lastName,
       apiKey: token,                       // <-- field renamed from `token`
-      plan: 'free',
-      tier: 'user',
-      memoryLimit: 100,
+      plan: 'paid',                        // full substrate from signup (full Monty)
+      tier: 'paid',                        // <-- was 'user' (stateless); now substrate-aware from message one
+      memoryLimit: 100000,
       timezone: null,                      // set from real browser tz (body.timezone) below; honest UTC at read-time if absent
       createdAt: now,                      // <-- renamed from `created_at`
       updatedAt: now,
@@ -145,7 +148,8 @@ module.exports = async function handler(req, res) {
         console.error('[claim] failed to record referral on referrer', e.message);
       }
     }
-    // ingest pre-auth turns under the new user's apiKey (best-effort)
+    // ingest pre-auth turns under the new user's apiKey (best-effort).
+    // No-op for classic name+email signup (turns === []).
     const ingestUrl = INGEST_BASE + '/api/ingest';
     const ingested = [];
     const failed = [];
