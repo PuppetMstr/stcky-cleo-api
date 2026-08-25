@@ -5,11 +5,16 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
   const isDeep = req.url.includes('/deep') || req.query.deep === 'true';
   const version = '4.5.0';
+  // Which build is actually serving. Added Aug 25 2026 so a deploy can be VERIFIED
+  // from outside instead of inferred -- the hourly heartbeat was the only door that
+  // named the running commit, which made every deploy unverifiable for up to an hour.
+  const commit = (process.env.VERCEL_GIT_COMMIT_SHA || '').slice(0, 7) || null;
   // Shallow health - just confirms server is running
   if (!isDeep) {
     return res.status(200).json({
       status: 'ok',
       version,
+      commit,
       functions: 12,
       endpoints: [
         'GET /api/health',
